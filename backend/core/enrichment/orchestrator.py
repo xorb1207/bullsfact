@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from typing import Optional
 
 from .base import Analyst, Enricher
+from .llm_client import BudgetExceeded
+from .synthesizer import Synthesizer
 from .types import AnalystResult, EnrichmentContext, Perspective
 from ..strategy.dip_buy import Signal
 
@@ -82,4 +84,67 @@ class StubEnricher(Enricher):
             )
         except Exception as e:
             log.error(f"[Orchestrator] enrich 실패: {e}")
+            return None
+
+
+class LLMEnricher(Enricher):
+    """
+    실제 LLM 사용:
+      1) Analyst들 병렬로 데이터 수집 (LLM 호출 X)
+      2) Synthesizer가 단일 LLM 호출로 EnrichmentContext 생성
+      3) 일일 비용 캡 초과 / LLM 실패 / JSON 파싱 실패 → None 반환 (raw 폴백)
+    """
+
+    def __init__(
+        self,
+        analysts: list[Analyst],
+        synthesizer: Synthesizer,
+        timeout_sec: float = 15.0,
+        max_workers: int = 3,
+    ):
+        self.analysts = analysts
+        self.synthesizer = synthesizer
+        self.timeout_sec = timeout_sec
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="enrich")
+
+    def _run_analysts(self, signal: Signal, source: str) -> list[AnalystResult]:
+        futures = {
+            self._executor.submit(a.analyze, signal, source): a.name
+            for a in self.analysts
+        }
+        results: list[AnalystResult] = []
+        for fut, name in futures.items():
+            try:
+                results.append(fut.result(timeout=self.timeout_sec))
+            except FuturesTimeoutError:
+                log.warning(f"[LLMEnricher] {name} 타임아웃")
+                results.append(AnalystResult(name=name, summary="", error="timeout"))
+            except Exception as e:
+                log.warning(f"[LLMEnricher] {name} 실패: {e}")
+                results.append(AnalystResult(name=name, summary="", error=str(e)))
+        return results
+
+    def enrich(self, signal: Signal, source: str) -> Optional[EnrichmentContext]:
+        t0 = time.monotonic()
+        try:
+            results = self._run_analysts(signal, source)
+
+            # 모든 애널리스트 데이터가 비어있으면 LLM 호출 안 함 (낭비)
+            has_any = any((r.summary or r.citations) and not r.error for r in results)
+            if not has_any:
+                log.info("[LLMEnricher] 수집된 데이터 없음 → LLM 호출 생략")
+                return None
+
+            ctx = self.synthesizer.synthesize(signal, source, results)
+            ctx.latency_ms = int((time.monotonic() - t0) * 1000)
+            log.info(
+                f"[LLMEnricher] {signal.ticker} 완료 "
+                f"({ctx.latency_ms}ms, ¢{ctx.cost_cents:.2f})"
+            )
+            return ctx
+        except BudgetExceeded as e:
+            log.warning(f"[LLMEnricher] 비용 캡 — 폴백: {e}")
+            return None
+        except Exception as e:
+            log.error(f"[LLMEnricher] enrich 실패: {e}", exc_info=True)
             return None

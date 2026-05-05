@@ -15,7 +15,7 @@ from backend.core.datasource import DataProvider
 from backend.core.strategy import DipBuyStrategy
 from backend.core.alerter import AlertEngine
 from backend.core.scanner import Scanner
-from backend.core.enrichment import StubEnricher
+from backend.core.enrichment import LLMClient, LLMEnricher, Synthesizer
 from backend.core.enrichment.analysts import NewsAnalyst, FundamentalsAnalyst
 from backend.db import init_db
 
@@ -44,9 +44,11 @@ def main() -> None:
         bb_std=float(os.getenv("BB_STD", "2.0")),
     )
 
-    enricher = StubEnricher(
+    llm = LLMClient(max_daily_usd=float(os.getenv("MAX_DAILY_LLM_USD", "2.0")))
+    enricher = LLMEnricher(
         analysts=[NewsAnalyst(), FundamentalsAnalyst()],
-        timeout_sec=10.0,
+        synthesizer=Synthesizer(llm=llm, model="claude-sonnet-4-6"),
+        timeout_sec=15.0,
     )
 
     alerter = AlertEngine(

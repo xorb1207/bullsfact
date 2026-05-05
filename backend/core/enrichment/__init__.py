@@ -5,7 +5,9 @@ Day 1: 골격 + stub. 실제 LLM 호출은 Day 2~3.
 """
 from .types import EnrichmentContext, AnalystResult, Perspective
 from .base import Analyst, Enricher
-from .orchestrator import StubEnricher
+from .orchestrator import StubEnricher, LLMEnricher
+from .llm_client import LLMClient, BudgetExceeded
+from .synthesizer import Synthesizer
 
 __all__ = [
     "EnrichmentContext",
@@ -14,4 +16,8 @@ __all__ = [
     "Analyst",
     "Enricher",
     "StubEnricher",
+    "LLMEnricher",
+    "LLMClient",
+    "BudgetExceeded",
+    "Synthesizer",
 ]
