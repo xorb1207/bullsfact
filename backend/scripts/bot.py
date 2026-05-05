@@ -15,6 +15,7 @@ import html
 import logging
 import math
 import os
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 
 import requests
+import schedule
 from dotenv import load_dotenv
 
 load_dotenv("backend/.env", override=True)
@@ -31,6 +33,7 @@ from backend.core.datasource import DataProvider
 from backend.core.strategy import DipBuyStrategy
 from backend.core.strategy.dip_buy import Signal, SignalStrength
 from backend.core.alerter import AlertEngine
+from backend.core.market import MarketFetcher, format_telegram as format_market
 
 log = logging.getLogger("bot")
 logging.basicConfig(
@@ -47,6 +50,7 @@ class BotContext:
     provider: DataProvider
     strategy: DipBuyStrategy
     alerter: AlertEngine
+    market: MarketFetcher
 
 
 # ──────────────────────────────────────────────
@@ -85,6 +89,9 @@ def cmd_help(args: list[str], ctx: BotContext) -> str:
         "━━━━━━━━━━━━━━━━━\n"
         "<b>/list</b> (또는 /ls)\n"
         "  워치리스트 + 현재 RSI/신호\n\n"
+        "<b>/market</b>\n"
+        "  시장 현황 (지수/채권/심리/크립토/원자재)\n"
+        "  매일 06:00 KST 자동 발송\n\n"
         "<b>/add TICKER</b>\n"
         "  종목 추가 (예: /add NVDA, /add ETH/USDT)\n\n"
         "<b>/remove TICKER</b> (또는 /rm)\n"
@@ -209,6 +216,23 @@ def cmd_cost(args: list[str], ctx: BotContext) -> str:
         db.close()
 
 
+def cmd_market(args: list[str], ctx: BotContext) -> str:
+    """시장 현황 스냅샷 — 지수/채권/심리/크립토/원자재."""
+    snap = ctx.market.fetch()
+    return format_market(snap)
+
+
+def send_market_report(ctx: BotContext) -> None:
+    """매일 자동 발송 (스케줄러 호출)."""
+    try:
+        log.info("[scheduler] 매일 시장 리포트 발송")
+        snap = ctx.market.fetch()
+        text = "🌅 <b>모닝 브리핑</b>\n\n" + format_market(snap)
+        send(ctx, text)
+    except Exception as e:
+        log.error(f"[scheduler] 매일 시장 리포트 실패: {e}\n{traceback.format_exc()}")
+
+
 def cmd_test(args: list[str], ctx: BotContext) -> str:
     """가짜 STRONG 시그널을 raw 모드로 발사 (LLM 비용 0)."""
     ticker = args[0].upper() if args else "ETH/USDT"
@@ -245,12 +269,14 @@ COMMANDS: dict[str, Callable[[list[str], BotContext], str]] = {
     "remove": cmd_remove,
     "rm":     cmd_remove,
     "cost":   cmd_cost,
+    "market": cmd_market,
     "test":   cmd_test,
 }
 
 # Telegram 자동완성 메뉴에 노출할 명령어 (alias는 제외 — 깔끔하게)
 COMMAND_DESCRIPTIONS: list[tuple[str, str]] = [
     ("list",   "워치리스트 + 현재 RSI/신호"),
+    ("market", "시장 현황 (지수/채권/심리/크립토)"),
     ("add",    "종목 추가 (예: /add NVDA)"),
     ("remove", "종목 삭제"),
     ("cost",   "LLM 비용 + 알람 카운트"),
@@ -267,6 +293,33 @@ def register_commands(ctx: BotContext) -> None:
         log.info(f"명령어 메뉴 등록 완료 ({len(commands)}개)")
     else:
         log.warning(f"setMyCommands 실패: {result}")
+
+
+def _start_daily_scheduler(ctx: BotContext) -> None:
+    """
+    매일 발송 작업을 별도 데몬 스레드로 실행.
+    schedule 1.2+ 의 timezone 인자 사용 (Asia/Seoul 06:00).
+    """
+    daily_at = os.getenv("MARKET_DAILY_AT_KST", "06:00")
+    try:
+        schedule.every().day.at(daily_at, "Asia/Seoul").do(send_market_report, ctx)
+    except Exception as e:
+        # schedule 구버전 폴백 — UTC로 환산해서 등록
+        log.warning(f"timezone 인자 미지원 — UTC로 환산: {e}")
+        h, m = map(int, daily_at.split(":"))
+        utc_h = (h - 9) % 24                                  # KST → UTC
+        schedule.every().day.at(f"{utc_h:02d}:{m:02d}").do(send_market_report, ctx)
+
+    def loop():
+        log.info(f"[scheduler] 매일 시장 리포트 KST {daily_at}")
+        while True:
+            try:
+                schedule.run_pending()
+            except Exception as e:
+                log.error(f"[scheduler] 실행 실패: {e}")
+            time.sleep(30)
+
+    threading.Thread(target=loop, daemon=True, name="market-scheduler").start()
 
 
 # ──────────────────────────────────────────────
@@ -334,12 +387,14 @@ def main() -> None:
         log_to_db=False,          # /test 는 DB에 안 쌓이게
         enricher=None,            # /test 는 raw
     )
+    market = MarketFetcher()
     ctx = BotContext(
         token=token, allowed_chat_id=chat_id,
-        provider=provider, strategy=strategy, alerter=alerter,
+        provider=provider, strategy=strategy, alerter=alerter, market=market,
     )
 
     register_commands(ctx)
+    _start_daily_scheduler(ctx)
     log.info("🤖 봇 시작 — 폴링 모드")
     offset: int | None = None
     backoff = 1
