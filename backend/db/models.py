@@ -49,3 +49,20 @@ class BacktestResult(Base):
 
 
 Index("ix_alert_log_ticker_sent", AlertLog.ticker, AlertLog.sent_at.desc())
+
+
+class LLMCallLog(Base):
+    """Synthesizer/Analyst의 LLM 호출 기록. 일일 비용 리포트에서 집계."""
+    __tablename__ = "llm_call_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    model = Column(String(64), nullable=False)
+    purpose = Column(String(32), nullable=False)             # "synthesizer" | "analyst:news" | ...
+    ticker = Column(String(32), nullable=True, index=True)
+    input_tokens = Column(Integer, nullable=False)
+    output_tokens = Column(Integer, nullable=False)
+    cache_read_tokens = Column(Integer, nullable=False, default=0)
+    cache_creation_tokens = Column(Integer, nullable=False, default=0)
+    cost_cents = Column(Float, nullable=False)
+    latency_ms = Column(Integer, nullable=True)
+    called_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
