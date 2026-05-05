@@ -7,7 +7,7 @@ from typing import Optional, Sequence
 from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 
-from .models import Watchlist, AlertLog, BacktestResult
+from .models import Watchlist, AlertLog, BacktestResult, LLMCallLog
 
 
 # ──────────────────────────────────────────────
@@ -149,3 +149,62 @@ def list_backtests(db: Session, ticker: Optional[str] = None, limit: int = 20) -
         stmt = stmt.where(BacktestResult.ticker == ticker)
     stmt = stmt.order_by(BacktestResult.created_at.desc()).limit(limit)
     return db.execute(stmt).scalars().all()
+
+
+# ──────────────────────────────────────────────
+# LLMCallLog
+# ──────────────────────────────────────────────
+
+def insert_llm_call(
+    db: Session,
+    *,
+    model: str,
+    purpose: str,
+    ticker: Optional[str],
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_creation_tokens: int,
+    cost_cents: float,
+    latency_ms: Optional[int] = None,
+) -> LLMCallLog:
+    row = LLMCallLog(
+        model=model,
+        purpose=purpose,
+        ticker=ticker,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+        cost_cents=cost_cents,
+        latency_ms=latency_ms,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def llm_cost_summary(
+    db: Session,
+    *,
+    since: datetime,
+    until: Optional[datetime] = None,
+) -> dict:
+    """기간 내 LLM 호출 집계. cost_report에서 사용."""
+    from sqlalchemy import func
+    stmt = select(
+        func.count(LLMCallLog.id).label("calls"),
+        func.coalesce(func.sum(LLMCallLog.cost_cents), 0.0).label("cents"),
+        func.coalesce(func.sum(LLMCallLog.input_tokens), 0).label("in_tokens"),
+        func.coalesce(func.sum(LLMCallLog.output_tokens), 0).label("out_tokens"),
+    ).where(LLMCallLog.called_at >= since)
+    if until:
+        stmt = stmt.where(LLMCallLog.called_at < until)
+    row = db.execute(stmt).one()
+    return {
+        "calls": row.calls,
+        "cost_usd": row.cents / 100.0,
+        "input_tokens": row.in_tokens,
+        "output_tokens": row.out_tokens,
+    }

@@ -6,9 +6,10 @@ Day 1: 클라이언트 셋업 + 비용 트래킹 골격만. 실제 호출은 Day
 import logging
 import os
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import date
-from typing import Optional
+from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +30,9 @@ class CallUsage:
     output_tokens: int
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    purpose: str = ""              # "synthesizer" | "analyst:news" | ...
+    ticker: Optional[str] = None
+    latency_ms: Optional[int] = None
 
     def cost_usd(self) -> float:
         in_rate, out_rate = _PRICING.get(self.model, (0.0, 0.0))
@@ -54,9 +58,11 @@ class LLMClient:
         self,
         api_key: Optional[str] = None,
         max_daily_usd: float = 2.0,
+        on_call: Optional[Callable[[CallUsage], None]] = None,
     ):
         self._api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
         self._max_daily_usd = max_daily_usd
+        self._on_call = on_call
         self._lock = threading.Lock()
         self._spent_today_usd: float = 0.0
         self._spent_date: date = date.today()
@@ -101,11 +107,10 @@ class LLMClient:
         user: str,
         max_tokens: int = 1024,
         cache_system: bool = True,
+        purpose: str = "",
+        ticker: Optional[str] = None,
     ) -> tuple[str, CallUsage]:
-        """
-        단일 메시지 호출. (text, usage) 반환.
-        Day 1: 실제 호출 코드는 작성하되, stub 단계에선 호출자가 안 부름.
-        """
+        """단일 메시지 호출. (text, usage) 반환."""
         self._check_and_reset_budget()
         client = self._ensure_client()
 
@@ -113,12 +118,14 @@ class LLMClient:
         if cache_system:
             system_blocks[0]["cache_control"] = {"type": "ephemeral"}
 
+        t0 = time.monotonic()
         resp = client.messages.create(
             model=model,
             max_tokens=max_tokens,
             system=system_blocks,
             messages=[{"role": "user", "content": user}],
         )
+        latency_ms = int((time.monotonic() - t0) * 1000)
 
         text = "".join(b.text for b in resp.content if b.type == "text")
         usage = CallUsage(
@@ -127,6 +134,14 @@ class LLMClient:
             output_tokens=resp.usage.output_tokens,
             cache_read_tokens=getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
             cache_creation_tokens=getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
+            purpose=purpose,
+            ticker=ticker,
+            latency_ms=latency_ms,
         )
         self._record_spend(usage)
+        if self._on_call:
+            try:
+                self._on_call(usage)
+            except Exception as e:
+                log.warning(f"[LLM] on_call 콜백 실패 (무시): {e}")
         return text, usage

@@ -100,6 +100,8 @@ class Synthesizer:
             user=user,
             max_tokens=self.max_tokens,
             cache_system=True,
+            purpose="synthesizer",
+            ticker=signal.ticker,
         )
         try:
             data = _extract_json(text)
