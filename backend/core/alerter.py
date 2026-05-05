@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Optional
 
 from .strategy.dip_buy import Signal, SignalStrength
+from .enrichment import Enricher, EnrichmentContext, Perspective
 from backend.db import SessionLocal, crud
 
 log = logging.getLogger(__name__)
@@ -27,13 +28,36 @@ def _fmt(value: Optional[float], spec: str = ".4f", prefix: str = "") -> str:
     return f"{prefix}{value:{spec}}"
 
 
-def _format_message(signal: Signal, source: str) -> str:
+_PERSPECTIVE_LABEL = {
+    Perspective.SCALP: "⚡ 단타",
+    Perspective.SWING: "🎯 스윙",
+    Perspective.LONG:  "🌱 장투",
+}
+
+
+def _format_enrichment(ctx: EnrichmentContext) -> str:
+    parts = ["", "━━━ 컨텍스트 ━━━"]
+    if ctx.headline:
+        parts.append(f"📰 {ctx.headline}")
+    if ctx.risk_flags:
+        parts.append(f"⚠️ {', '.join(ctx.risk_flags)}")
+    for persp, label in _PERSPECTIVE_LABEL.items():
+        text = ctx.perspectives.get(persp)
+        if text:
+            parts.append(f"\n{label}\n{text}")
+    if ctx.citations:
+        links = " ".join(f'<a href="{u}">[{i+1}]</a>' for i, u in enumerate(ctx.citations))
+        parts.append(f"\n📎 {links}")
+    return "\n".join(parts)
+
+
+def _format_message(signal: Signal, source: str, enrichment: Optional[EnrichmentContext] = None) -> str:
     emoji = _STRENGTH_EMOJI[signal.strength]
     label = "강한 매수 신호" if signal.strength == SignalStrength.STRONG else "매수 신호"
     reasons_text = "\n".join(f"  • {r}" for r in signal.reasons)
     ind = signal.indicators
 
-    return (
+    base = (
         f"{emoji} <b>{label} — {signal.ticker}</b> [{source}]\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 현재가: <b>${signal.price:.4f}</b>\n"
@@ -42,12 +66,18 @@ def _format_message(signal: Signal, source: str) -> str:
         f"\n"
         f"📊 RSI:     <b>{_fmt(ind.get('rsi'), '.1f')}</b>\n"
         f"📉 BB 하단: <b>{_fmt(ind.get('bb_lower'), '.4f', '$')}</b>\n"
-        f"📈 BB 중앙: {_fmt(ind.get('bb_mid'), '.4f', '$')}\n"
-        f"\n"
-        f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC\n"
+        f"📈 BB 중앙: {_fmt(ind.get('bb_mid'), '.4f', '$')}"
+    )
+
+    enrichment_text = _format_enrichment(enrichment) if enrichment else ""
+
+    footer = (
+        f"\n\n⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<i>⚠️ 참고용 알람. 투자 결정은 본인 판단으로.</i>"
     )
+
+    return base + enrichment_text + footer
 
 
 class AlertEngine:
@@ -58,11 +88,13 @@ class AlertEngine:
         telegram_chat_id: str,
         cooldown_min: int = 60,
         log_to_db: bool = True,
+        enricher: Optional[Enricher] = None,
     ):
         self._token = telegram_token
         self._chat_id = telegram_chat_id
         self._cooldown_min = cooldown_min
         self._log_to_db = log_to_db
+        self._enricher = enricher
         self._last_alert: dict[str, datetime] = {}
 
     def _is_on_cooldown(self, ticker: str) -> bool:
@@ -116,6 +148,18 @@ class AlertEngine:
         except Exception as e:
             log.warning(f"[AlertEngine] DB 로깅 실패: {e}")
 
+    def _maybe_enrich(self, signal: Signal, source: str) -> Optional[EnrichmentContext]:
+        """STRONG일 때만 enrich. 실패/None은 호출자가 raw로 폴백."""
+        if self._enricher is None:
+            return None
+        if signal.strength != SignalStrength.STRONG:
+            return None
+        try:
+            return self._enricher.enrich(signal, source)
+        except Exception as e:
+            log.warning(f"[AlertEngine] enrich 실패 — raw 알람으로 폴백: {e}")
+            return None
+
     def process(self, signal: Signal, source: str) -> bool:
         if signal.strength == SignalStrength.NONE:
             return False
@@ -124,7 +168,8 @@ class AlertEngine:
             log.info(f"[AlertEngine] {signal.ticker} 쿨다운 중 — 스킵")
             return False
 
-        message = _format_message(signal, source)
+        enrichment = self._maybe_enrich(signal, source)
+        message = _format_message(signal, source, enrichment)
         sent = self._send_telegram(message)
 
         if sent:

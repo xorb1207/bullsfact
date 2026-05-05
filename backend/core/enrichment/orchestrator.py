@@ -1,0 +1,85 @@
+"""
+Orchestrator — Analyst들을 병렬 실행하고 Synthesizer로 묶어 EnrichmentContext 반환.
+
+Day 1 구현 (StubEnricher):
+  - 실제 LLM 호출 없이 stub Analyst만 실행
+  - EnrichmentContext에 더미 perspectives 채워서 알람 포맷 검증용
+  - 타임아웃/폴백/스레드풀 골격은 진짜처럼 갖춤 (Day 2~3에서 실제 LLM으로 교체만)
+"""
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from typing import Optional
+
+from .base import Analyst, Enricher
+from .types import AnalystResult, EnrichmentContext, Perspective
+from ..strategy.dip_buy import Signal
+
+log = logging.getLogger(__name__)
+
+
+class StubEnricher(Enricher):
+    """Day 1 stub — 실제 LLM 호출 없이 더미 컨텍스트 생성."""
+
+    def __init__(
+        self,
+        analysts: list[Analyst],
+        timeout_sec: float = 10.0,
+        max_workers: int = 3,
+    ):
+        self.analysts = analysts
+        self.timeout_sec = timeout_sec
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="enrich")
+
+    def _run_analysts(self, signal: Signal, source: str) -> list[AnalystResult]:
+        """모든 애널리스트 병렬 실행. 개별 실패는 잡고 빈 결과로."""
+        futures = {
+            self._executor.submit(a.analyze, signal, source): a.name
+            for a in self.analysts
+        }
+        results: list[AnalystResult] = []
+        for fut, name in futures.items():
+            try:
+                results.append(fut.result(timeout=self.timeout_sec))
+            except FuturesTimeoutError:
+                log.warning(f"[Orchestrator] {name} 타임아웃")
+                results.append(AnalystResult(name=name, summary="", error="timeout"))
+            except Exception as e:
+                log.warning(f"[Orchestrator] {name} 실패: {e}")
+                results.append(AnalystResult(name=name, summary="", error=str(e)))
+        return results
+
+    def _stub_perspectives(self, signal: Signal) -> dict[Perspective, str]:
+        # Day 1 더미 — Day 3 Synthesizer가 LLM으로 진짜 코멘트 채움
+        return {
+            Perspective.SCALP: f"(stub) {signal.ticker} 단타 관점 코멘트 자리.",
+            Perspective.SWING: f"(stub) {signal.ticker} 스윙 관점 코멘트 자리.",
+            Perspective.LONG:  f"(stub) {signal.ticker} 장투 관점 코멘트 자리.",
+        }
+
+    def enrich(self, signal: Signal, source: str) -> Optional[EnrichmentContext]:
+        t0 = time.monotonic()
+        try:
+            analyst_results = self._run_analysts(signal, source)
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+            citations: list[str] = []
+            for r in analyst_results:
+                citations.extend(r.citations)
+
+            # 적어도 하나는 성공해야 의미 있음. 전부 실패면 None → 폴백
+            if all(r.error for r in analyst_results):
+                log.warning("[Orchestrator] 모든 애널리스트 실패 — None 반환")
+                return None
+
+            return EnrichmentContext(
+                headline="(stub) 컨텍스트 헤드라인 자리",
+                citations=citations,
+                perspectives=self._stub_perspectives(signal),
+                risk_flags=[],
+                cost_cents=0.0,
+                latency_ms=elapsed_ms,
+            )
+        except Exception as e:
+            log.error(f"[Orchestrator] enrich 실패: {e}")
+            return None

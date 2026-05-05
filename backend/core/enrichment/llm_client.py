@@ -1,0 +1,132 @@
+"""
+Anthropic 클라이언트 래퍼 — 일일 비용 캡, 프롬프트 캐싱, 사용량 추적.
+
+Day 1: 클라이언트 셋업 + 비용 트래킹 골격만. 실제 호출은 Day 2~3에서 사용.
+"""
+import logging
+import os
+import threading
+from dataclasses import dataclass
+from datetime import date
+from typing import Optional
+
+log = logging.getLogger(__name__)
+
+
+# 모델별 단가 (USD per 1M tokens) — 2026 기준 가격표 변경 시 업데이트
+_PRICING: dict[str, tuple[float, float]] = {
+    # model: (input_per_1m, output_per_1m)
+    "claude-haiku-4-5":  (1.00, 5.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-opus-4-7":   (15.00, 75.00),
+}
+
+
+@dataclass
+class CallUsage:
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+
+    def cost_usd(self) -> float:
+        in_rate, out_rate = _PRICING.get(self.model, (0.0, 0.0))
+        # 캐시 read는 input의 10%, cache write는 input의 125% (Anthropic 공식)
+        regular_in = self.input_tokens / 1_000_000 * in_rate
+        cache_in   = self.cache_read_tokens / 1_000_000 * in_rate * 0.10
+        cache_out  = self.cache_creation_tokens / 1_000_000 * in_rate * 1.25
+        out        = self.output_tokens / 1_000_000 * out_rate
+        return regular_in + cache_in + cache_out + out
+
+
+class BudgetExceeded(RuntimeError):
+    pass
+
+
+class LLMClient:
+    """
+    얇은 Anthropic 래퍼. 일일 비용 캡 초과 시 BudgetExceeded raise.
+    호출자(Enricher)는 이걸 잡아서 raw 알람으로 폴백.
+    """
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        max_daily_usd: float = 2.0,
+    ):
+        self._api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
+        self._max_daily_usd = max_daily_usd
+        self._lock = threading.Lock()
+        self._spent_today_usd: float = 0.0
+        self._spent_date: date = date.today()
+        self._client = None  # lazy init
+
+    def _ensure_client(self):
+        if self._client is None:
+            if not self._api_key:
+                raise RuntimeError("ANTHROPIC_API_KEY 미설정")
+            from anthropic import Anthropic
+            self._client = Anthropic(api_key=self._api_key)
+        return self._client
+
+    def _check_and_reset_budget(self) -> None:
+        with self._lock:
+            today = date.today()
+            if today != self._spent_date:
+                self._spent_date = today
+                self._spent_today_usd = 0.0
+            if self._spent_today_usd >= self._max_daily_usd:
+                raise BudgetExceeded(
+                    f"일일 LLM 비용 캡 ${self._max_daily_usd:.2f} 초과 "
+                    f"(오늘 누적 ${self._spent_today_usd:.4f})"
+                )
+
+    def _record_spend(self, usage: CallUsage) -> None:
+        with self._lock:
+            self._spent_today_usd += usage.cost_usd()
+            log.debug(
+                f"[LLM] {usage.model} cost=${usage.cost_usd():.5f} "
+                f"누적=${self._spent_today_usd:.4f}"
+            )
+
+    def spent_today_usd(self) -> float:
+        with self._lock:
+            return self._spent_today_usd
+
+    def call(
+        self,
+        model: str,
+        system: str,
+        user: str,
+        max_tokens: int = 1024,
+        cache_system: bool = True,
+    ) -> tuple[str, CallUsage]:
+        """
+        단일 메시지 호출. (text, usage) 반환.
+        Day 1: 실제 호출 코드는 작성하되, stub 단계에선 호출자가 안 부름.
+        """
+        self._check_and_reset_budget()
+        client = self._ensure_client()
+
+        system_blocks = [{"type": "text", "text": system}]
+        if cache_system:
+            system_blocks[0]["cache_control"] = {"type": "ephemeral"}
+
+        resp = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system_blocks,
+            messages=[{"role": "user", "content": user}],
+        )
+
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        usage = CallUsage(
+            model=model,
+            input_tokens=resp.usage.input_tokens,
+            output_tokens=resp.usage.output_tokens,
+            cache_read_tokens=getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
+            cache_creation_tokens=getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
+        )
+        self._record_spend(usage)
+        return text, usage

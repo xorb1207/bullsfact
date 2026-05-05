@@ -15,6 +15,8 @@ from backend.core.datasource import DataProvider
 from backend.core.strategy import DipBuyStrategy
 from backend.core.alerter import AlertEngine
 from backend.core.scanner import Scanner
+from backend.core.enrichment import StubEnricher
+from backend.core.enrichment.analysts import NewsAnalyst, FundamentalsAnalyst
 from backend.db import init_db
 
 load_dotenv()
@@ -42,10 +44,16 @@ def main() -> None:
         bb_std=float(os.getenv("BB_STD", "2.0")),
     )
 
+    enricher = StubEnricher(
+        analysts=[NewsAnalyst(), FundamentalsAnalyst()],
+        timeout_sec=10.0,
+    )
+
     alerter = AlertEngine(
         telegram_token=os.getenv("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN"),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID"),
         cooldown_min=int(os.getenv("COOLDOWN_MIN", "60")),
+        enricher=enricher,
     )
 
     scanner = Scanner(
