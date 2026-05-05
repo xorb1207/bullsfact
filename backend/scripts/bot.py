@@ -248,6 +248,26 @@ COMMANDS: dict[str, Callable[[list[str], BotContext], str]] = {
     "test":   cmd_test,
 }
 
+# Telegram 자동완성 메뉴에 노출할 명령어 (alias는 제외 — 깔끔하게)
+COMMAND_DESCRIPTIONS: list[tuple[str, str]] = [
+    ("list",   "워치리스트 + 현재 RSI/신호"),
+    ("add",    "종목 추가 (예: /add NVDA)"),
+    ("remove", "종목 삭제"),
+    ("cost",   "LLM 비용 + 알람 카운트"),
+    ("test",   "가짜 STRONG 알람 (헬스체크)"),
+    ("help",   "명령어 목록"),
+]
+
+
+def register_commands(ctx: BotContext) -> None:
+    """Telegram에 명령어 메뉴 등록 (setMyCommands)."""
+    commands = [{"command": cmd, "description": desc} for cmd, desc in COMMAND_DESCRIPTIONS]
+    result = _api(ctx, "setMyCommands", commands=commands)
+    if result.get("ok"):
+        log.info(f"명령어 메뉴 등록 완료 ({len(commands)}개)")
+    else:
+        log.warning(f"setMyCommands 실패: {result}")
+
 
 # ──────────────────────────────────────────────
 # 폴링 루프
@@ -319,6 +339,7 @@ def main() -> None:
         provider=provider, strategy=strategy, alerter=alerter,
     )
 
+    register_commands(ctx)
     log.info("🤖 봇 시작 — 폴링 모드")
     offset: int | None = None
     backoff = 1
