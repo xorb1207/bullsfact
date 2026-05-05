@@ -2,6 +2,7 @@
 Alert Engine — 신호를 받아 Telegram 발송 + DB 로깅.
 쿨다운은 메모리에서 관리 (재시작 시 초기화).
 """
+import html
 import logging
 import math
 import requests
@@ -11,6 +12,11 @@ from typing import Optional
 from .strategy.dip_buy import Signal, SignalStrength
 from .enrichment import Enricher, EnrichmentContext, Perspective
 from backend.db import SessionLocal, crud
+
+
+def _esc(s: str) -> str:
+    """Telegram HTML parse_mode에 안전한 텍스트로 이스케이프."""
+    return html.escape(s, quote=False)
 
 log = logging.getLogger(__name__)
 
@@ -38,15 +44,19 @@ _PERSPECTIVE_LABEL = {
 def _format_enrichment(ctx: EnrichmentContext) -> str:
     parts = ["", "━━━ 컨텍스트 ━━━"]
     if ctx.headline:
-        parts.append(f"📰 {ctx.headline}")
+        parts.append(f"📰 {_esc(ctx.headline)}")
     if ctx.risk_flags:
-        parts.append(f"⚠️ {', '.join(ctx.risk_flags)}")
+        parts.append(f"⚠️ {_esc(', '.join(ctx.risk_flags))}")
     for persp, label in _PERSPECTIVE_LABEL.items():
         text = ctx.perspectives.get(persp)
         if text:
-            parts.append(f"\n{label}\n{text}")
+            parts.append(f"\n{label}\n{_esc(text)}")
     if ctx.citations:
-        links = " ".join(f'<a href="{u}">[{i+1}]</a>' for i, u in enumerate(ctx.citations))
+        # URL 자체는 escape하면 안 됨 (HTML attribute로 들어가니 quote만 escape)
+        links = " ".join(
+            f'<a href="{html.escape(u, quote=True)}">[{i+1}]</a>'
+            for i, u in enumerate(ctx.citations)
+        )
         parts.append(f"\n📎 {links}")
     return "\n".join(parts)
 
@@ -54,11 +64,11 @@ def _format_enrichment(ctx: EnrichmentContext) -> str:
 def _format_message(signal: Signal, source: str, enrichment: Optional[EnrichmentContext] = None) -> str:
     emoji = _STRENGTH_EMOJI[signal.strength]
     label = "강한 매수 신호" if signal.strength == SignalStrength.STRONG else "매수 신호"
-    reasons_text = "\n".join(f"  • {r}" for r in signal.reasons)
+    reasons_text = "\n".join(f"  • {_esc(r)}" for r in signal.reasons)
     ind = signal.indicators
 
     base = (
-        f"{emoji} <b>{label} — {signal.ticker}</b> [{source}]\n"
+        f"{emoji} <b>{label} — {_esc(signal.ticker)}</b> [{_esc(source)}]\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💰 현재가: <b>${signal.price:.4f}</b>\n"
         f"\n"
@@ -114,10 +124,16 @@ class AlertEngine:
                 json={"chat_id": self._chat_id, "text": message, "parse_mode": "HTML"},
                 timeout=10,
             )
-            resp.raise_for_status()
+            if not resp.ok:
+                # 본문만 로깅 (URL에 토큰이 박혀있어 e/__str__ 사용 금지)
+                log.error(
+                    f"Telegram 전송 실패 status={resp.status_code} body={resp.text[:300]}"
+                )
+                return False
             return True
-        except Exception as e:
-            log.error(f"Telegram 전송 실패: {e}")
+        except requests.exceptions.RequestException as e:
+            # 네트워크 오류 등 — 메시지에서 URL/토큰 마스킹
+            log.error(f"Telegram 전송 네트워크 오류: {type(e).__name__}")
             return False
 
     def _persist(self, signal: Signal, source: str) -> None:
