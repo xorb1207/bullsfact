@@ -5,12 +5,19 @@ Strategy는 DataProvider에서 받은 OHLCV에
 지표를 추가하고 신호(Signal)를 반환.
 새 전략 추가 시 BaseStrategy만 상속하면 됨.
 """
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional, TYPE_CHECKING
 
 import pandas as pd
 import pandas_ta as ta
+
+if TYPE_CHECKING:
+    from ..datasource.calendar_fetcher import CalendarFetcher
+
+log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────
@@ -66,11 +73,13 @@ class DipBuyStrategy(BaseStrategy):
         rsi_threshold: float = 35.0,
         bb_period:     int   = 20,
         bb_std:        float = 2.0,
+        calendar_fetcher: Optional["CalendarFetcher"] = None,
     ):
-        self.rsi_period    = rsi_period
-        self.rsi_threshold = rsi_threshold
-        self.bb_period     = bb_period
-        self.bb_std        = bb_std
+        self.rsi_period       = rsi_period
+        self.rsi_threshold    = rsi_threshold
+        self.bb_period        = bb_period
+        self.bb_std           = bb_std
+        self.calendar_fetcher = calendar_fetcher
 
     def populate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         close = df["close"]
@@ -114,6 +123,13 @@ class DipBuyStrategy(BaseStrategy):
             strength = SignalStrength.WEAK
         else:
             strength = SignalStrength.NONE
+
+        # M1: 이벤트 캘린더 컨텍스트 주입 (graceful, 실패해도 시그널은 정상 발동)
+        if self.calendar_fetcher is not None:
+            try:
+                reasons.extend(self.calendar_fetcher.get_context_strings(ticker))
+            except Exception as e:
+                log.debug(f"[DipBuy] calendar context 실패 ({ticker}): {type(e).__name__}: {e}")
 
         return Signal(
             ticker=ticker,

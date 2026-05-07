@@ -42,6 +42,7 @@ from backend.core.on_demand import (
 from backend.core.enrichment.llm_client import LLMClient
 from backend.core.positions import MILESTONES, highest_passed_milestone
 from backend.core.money import format_money, format_money_signed, currency_for
+from backend.core.datasource.calendar_fetcher import CalendarFetcher
 
 log = logging.getLogger("bot")
 logging.basicConfig(
@@ -60,6 +61,7 @@ class BotContext:
     alerter: AlertEngine
     market: MarketFetcher
     llm: Optional[LLMClient] = None         # 매크로 해설 / on-demand 분석에 사용
+    calendar: Optional[CalendarFetcher] = None  # M1: 이벤트 캘린더 (어닝/매크로/공시)
 
 
 # ──────────────────────────────────────────────
@@ -153,26 +155,127 @@ def cmd_list(args: list[str], ctx: BotContext) -> str:
     if not items:
         return "워치리스트 비어있음. <code>/add TICKER</code> 로 추가."
 
-    rows = ["<b>워치리스트</b>", "━━━━━━━━━━━━━━━━━"]
+    # 스캐너와 동일 interval/period 사용 — RSI 일관성 확보
+    interval = os.getenv("DATA_INTERVAL", "1d")
+    period = os.getenv("DATA_PERIOD", "2y")
+
+    rows = [
+        "<b>워치리스트</b>  <i>⚪정상 · 🟡약신호 · 🔴강신호</i>",
+        "━━━━━━━━━━━━━━━━━",
+    ]
     for w in items:
-        name_str = f"  <i>{_esc(w.name)}</i>" if w.name else ""
+        short_name = _short_company_name(w.name)
+        name_str = f"  <i>{_esc(short_name)}</i>" if short_name else ""
         if not w.active:
-            rows.append(f"⚪ {_esc(w.ticker)} ({w.source}){name_str} — 비활성")
+            rows.append(f"⚪ {_esc(w.ticker)}{name_str} — 비활성")
             continue
         try:
-            df = ctx.provider.get_ohlcv(w.ticker, interval="1h", period="60d")
+            df = ctx.provider.get_ohlcv(w.ticker, interval=interval, period=period)
             sig = ctx.strategy.generate_signal(df, w.ticker)
             rsi = sig.indicators.get("rsi")
             rsi_str = f"{rsi:.1f}" if isinstance(rsi, float) and not math.isnan(rsi) else "N/A"
             emoji = {"strong": "🔴", "weak": "🟡", "none": "⚪"}.get(sig.strength.value, "⚪")
             price_str = format_money(sig.price, w.ticker)
-            rows.append(
-                f"{emoji} <b>{_esc(w.ticker)}</b> ({w.source}){name_str} "
-                f"{price_str} | RSI {rsi_str} | {sig.strength.value}"
-            )
+
+            # 일일 변동률 (마지막 캔들 vs 그 직전)
+            close = df["close"]
+            if len(close) >= 2:
+                prev = float(close.iloc[-2])
+                cur = float(close.iloc[-1])
+                change_pct = (cur - prev) / prev * 100 if prev else 0.0
+                change_str = f"{change_pct:+.2f}%"
+            else:
+                change_str = ""
+
+            # 2줄 구조 — 모바일 가독성
+            rows.append(f"{emoji} <b>{_esc(w.ticker)}</b>{name_str}")
+            metric_parts = [price_str]
+            if change_str:
+                metric_parts.append(change_str)
+            metric_parts.append(f"RSI {rsi_str}")
+            rows.append("   " + "  ·  ".join(metric_parts))
+
+            # M1: 캘린더 suffix는 추가 라인
+            cal_suffix = _ticker_calendar_suffix(ctx, w.ticker)
+            if cal_suffix:
+                rows.append(f"   {cal_suffix}")
         except Exception as e:
-            rows.append(f"⚠️ {_esc(w.ticker)}{name_str}: {_esc(type(e).__name__)}")
+            rows.append(f"⚠️ <b>{_esc(w.ticker)}</b>{name_str}: {_esc(type(e).__name__)}")
     return "\n".join(rows)
+
+
+def _ticker_calendar_suffix(ctx: BotContext, ticker: str, lookahead_days: int = 14) -> str:
+    """
+    종목 한정 이벤트 (어닝/공시) 한 줄 요약. 매크로는 /market 에서 따로 표시.
+
+    공시는 같은 날에 여러 건이 흔함(특수관계인 거래·배당·실적 등 동시 공시).
+    날짜별로 group → "📑 공시 D+N (M건)" 통합 표시.
+    """
+    if ctx.calendar is None:
+        return ""
+    try:
+        events = ctx.calendar.get_events(ticker, lookahead_days=lookahead_days)
+    except Exception:
+        return ""
+    ticker_events = [e for e in events if e.ticker]
+    if not ticker_events:
+        return ""
+
+    parts: list[str] = []
+
+    # 어닝스 (보통 분기 1회라 dedupe 불필요)
+    for ev in ticker_events:
+        if ev.event_type == "earnings":
+            if ev.days_until == 0:
+                tag = "오늘"
+            elif ev.days_until > 0:
+                tag = f"D-{ev.days_until}"
+            else:
+                tag = f"{-ev.days_until}일 전"
+            parts.append(f"🎯 어닝 {tag}")
+            break  # 가장 가까운 어닝만
+
+    # 공시 — 날짜별로 그룹화
+    dart_events = [e for e in ticker_events if e.event_type == "dart"]
+    if dart_events:
+        from collections import Counter
+        date_counts = Counter(e.event_date for e in dart_events)
+        # 가까운 날짜 우선 (음수=과거, 절댓값 작은 순)
+        for ev_date, count in sorted(date_counts.items(), key=lambda x: -x[0].toordinal())[:2]:
+            days = (ev_date - dart_events[0].event_date).days  # 그냥 reference
+            # 명시적으로 다시 계산 (이벤트 객체에서 days_until 가져오기)
+            d_until = next(e.days_until for e in dart_events if e.event_date == ev_date)
+            if d_until == 0:
+                tag = "오늘"
+            elif d_until > 0:
+                tag = f"D-{d_until}"
+            else:
+                tag = f"{-d_until}일 전"
+            count_str = f" ({count}건)" if count > 1 else ""
+            parts.append(f"📑 공시 {tag}{count_str}")
+
+    return " · ".join(parts)
+
+
+def _short_company_name(name: Optional[str], max_len: int = 26) -> str:
+    """회사명 긴 거 잘라서 짧게. ETF 후미·법인격 제거 + cutoff."""
+    if not name:
+        return ""
+    # 흔한 후미 제거 (정보가치 낮음)
+    suffixes = [
+        ", Ltd.", " Ltd.", ", Inc.", " Inc.", " Incorporated",
+        " Corporation", " Corp.", " Co., Ltd.", " Company",
+        " Trust", " Trust ETF", " Mini Trust ETF",
+    ]
+    cleaned = name
+    # 가장 긴 매칭부터 (Co., Ltd. → Inc. 순 들어감)
+    for s in sorted(suffixes, key=len, reverse=True):
+        if cleaned.endswith(s):
+            cleaned = cleaned[: -len(s)].rstrip(",. ")
+            break
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max_len - 1].rstrip() + "…"
 
 
 def _fetch_ticker_name(ticker: str, source: str) -> Optional[str]:
@@ -270,10 +373,35 @@ def cmd_cost(args: list[str], ctx: BotContext) -> str:
         db.close()
 
 
+def _format_upcoming_events_section(ctx: BotContext, lookahead_days: int = 21) -> str:
+    """매크로 임박 이벤트 섹션 (FOMC + FRED CPI/PPI/NFP). 종목 무관."""
+    if ctx.calendar is None:
+        return ""
+    try:
+        events = ctx.calendar.get_events("", lookahead_days=lookahead_days)
+    except Exception:
+        return ""
+    if not events:
+        return ""
+    lines = [f"📅 <b>임박 이벤트</b> (D-{lookahead_days} 이내)"]
+    for ev in events[:8]:  # 너무 길어지지 않게
+        if ev.days_until == 0:
+            tag = "오늘"
+        elif ev.days_until == 1:
+            tag = f"⚠️ D-1 ({ev.event_date.isoformat()})"
+        else:
+            tag = f"D-{ev.days_until} ({ev.event_date.isoformat()})"
+        lines.append(f"  {_esc(ev.description)} — {tag}")
+    # 본문 뒤에 빈 줄 한 칸 띄워서 시각적 분리
+    return "\n\n" + "\n".join(lines)
+
+
 def cmd_market(args: list[str], ctx: BotContext) -> str:
-    """시장 현황 스냅샷 — 지수/채권/심리/크립토/원자재."""
+    """시장 현황 스냅샷 — 지수/채권/심리/크립토/원자재 + 임박 이벤트."""
     snap = ctx.market.fetch()
-    return format_market(snap)
+    body = format_market(snap)
+    events_section = _format_upcoming_events_section(ctx)
+    return body + events_section
 
 
 def send_market_report(ctx: BotContext) -> None:
@@ -562,7 +690,10 @@ def _cmd_position_list(ctx: BotContext) -> str:
 
 
 def _format_position_list(rows, db, ctx: BotContext) -> str:
-    lines = ["<b>보유 포지션</b>", "━━━━━━━━━━━━━━━━━"]
+    lines = [
+        "<b>보유 포지션</b>  <i>🟢이익 · 🔴손실</i>",
+        "━━━━━━━━━━━━━━━━━",
+    ]
     totals: dict[str, dict] = {}  # cur → {"value": float, "pnl": float}
 
     for p in rows:
@@ -582,13 +713,13 @@ def _format_position_list(rows, db, ctx: BotContext) -> str:
         slot["value"] += value
         slot["pnl"] += pnl
 
-        # 회사명 (Watchlist 캐시 활용)
+        # 회사명 (Watchlist 캐시 활용, short form)
         wl = crud.get_watchlist_item(db, p.ticker)
-        name_str = f"  <i>{_esc(wl.name)}</i>" if wl and wl.name else ""
+        short_name = _short_company_name(wl.name) if wl else ""
+        name_str = f"  <i>{_esc(short_name)}</i>" if short_name else ""
 
         emoji = "🟢" if ret >= 0 else "🔴"
         ms_str = _next_milestone_label(p.highest_milestone, ret)
-        notes_str = f"\n   📝 {_esc(p.notes)}" if p.notes else ""
         qty_str = f"{p.qty:.4f}".rstrip("0").rstrip(".")
 
         price_str = format_money(cur, p.ticker)
@@ -596,12 +727,12 @@ def _format_position_list(rows, db, ctx: BotContext) -> str:
         value_str = format_money(value, p.ticker)
         pnl_str = format_money_signed(pnl, p.ticker)
 
-        lines.append(
-            f"{emoji} <b>{_esc(p.ticker)}</b>{name_str}  {ret*100:+.1f}%  "
-            f"({qty_str}주 × {price_str} = {value_str})\n"
-            f"   평단 {avg_str} | 손익 {pnl_str} | {_esc(ms_str)}"
-            f"{notes_str}"
-        )
+        # 멀티라인 구조 — 모바일 가독성 통일
+        lines.append(f"{emoji} <b>{_esc(p.ticker)}</b>{name_str}")
+        lines.append(f"   <b>{ret*100:+.1f}%</b>  ·  {value_str} ({qty_str}주)  ·  손익 {pnl_str}")
+        lines.append(f"   평단 {avg_str}  ·  현재 {price_str}  ·  {_esc(ms_str)}")
+        if p.notes:
+            lines.append(f"   📝 {_esc(p.notes)}")
 
     lines.append("━━━━━━━━━━━━━━━━━")
     if totals:
@@ -757,9 +888,17 @@ def cmd_test(args: list[str], ctx: BotContext) -> str:
         source = "yfinance"
         price, bb_lower = 18.42, 18.65
 
+    reasons = ["RSI=31.2 < 35", f"가격 ${price:.2f} < BB하단 ${bb_lower:.2f}"]
+    # M1: 실제 발동 경로와 동일하게 캘린더 컨텍스트 주입 (검증 목적)
+    if ctx.calendar is not None:
+        try:
+            reasons.extend(ctx.calendar.get_context_strings(ticker))
+        except Exception as e:
+            log.debug(f"[/test] calendar 실패 (무시): {type(e).__name__}: {e}")
+
     sig = Signal(
         ticker=ticker, strength=SignalStrength.STRONG, price=price,
-        reasons=["RSI=31.2 < 35", f"가격 ${price:.2f} < BB하단 ${bb_lower:.2f}"],
+        reasons=reasons,
         indicators={"rsi": 31.2, "bb_lower": bb_lower, "bb_mid": price + 1, "bb_upper": price + 2},
     )
 
@@ -910,6 +1049,9 @@ def main() -> None:
     )
     market = MarketFetcher()
 
+    # M1: 이벤트 캘린더 (FINNHUB/FRED/DART 키 없으면 자동 silent skip)
+    calendar = CalendarFetcher()
+
     # LLMClient — 매크로 해설 / on-demand 분석용. ANTHROPIC_API_KEY 없으면 None.
     llm: Optional[LLMClient] = None
     if os.getenv("ANTHROPIC_API_KEY"):
@@ -924,7 +1066,7 @@ def main() -> None:
     ctx = BotContext(
         token=token, allowed_chat_id=chat_id,
         provider=provider, strategy=strategy, alerter=alerter, market=market,
-        llm=llm,
+        llm=llm, calendar=calendar,
     )
 
     register_commands(ctx)

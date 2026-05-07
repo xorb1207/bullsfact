@@ -25,6 +25,7 @@ from backend.core.scanner import Scanner
 from backend.core.threshold_alerts import ThresholdAlertEvaluator
 from backend.core.positions import PositionEvaluator
 from backend.core.market import MarketFetcher
+from backend.core.datasource.calendar_fetcher import CalendarFetcher
 from backend.core.enrichment import LLMClient, LLMEnricher, Synthesizer
 from backend.core.enrichment.analysts import NewsAnalyst, FundamentalsAnalyst
 from backend.db import init_db, SessionLocal, crud
@@ -81,9 +82,13 @@ def build_pipeline() -> Pipeline:
         binance_api_secret=os.getenv("BINANCE_API_SECRET", ""),
     )
 
+    # M1: 이벤트 캘린더 — 환경변수 키로 자동 활성/비활성. 키 없으면 silent skip.
+    calendar_fetcher = CalendarFetcher()
+
     strategy = DipBuyStrategy(
         rsi_threshold=float(os.getenv("RSI_THRESHOLD", "35")),
         bb_std=float(os.getenv("BB_STD", "2.0")),
+        calendar_fetcher=calendar_fetcher,
     )
 
     llm = LLMClient(
@@ -103,7 +108,7 @@ def build_pipeline() -> Pipeline:
         enricher=enricher,
     )
 
-    threshold_eval = ThresholdAlertEvaluator()
+    threshold_eval = ThresholdAlertEvaluator(calendar_fetcher=calendar_fetcher)
     market_fetcher = MarketFetcher()
     position_eval = PositionEvaluator()
 

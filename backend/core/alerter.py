@@ -163,6 +163,11 @@ def _format_threshold_message(ev: AlertEvaluation) -> str:
     # 노트
     note_line = f"\n\n📌 {_esc(a.note)}" if a.note else ""
 
+    # M1: 이벤트 캘린더 컨텍스트 (있을 때만)
+    cal_lines = ""
+    if ev.calendar_contexts:
+        cal_lines = "\n\n" + "\n".join(_esc(c) for c in ev.calendar_contexts)
+
     footer = (
         f"\n\n⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -174,6 +179,7 @@ def _format_threshold_message(ev: AlertEvaluation) -> str:
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{value_line}"
         f"{note_line}"
+        f"{cal_lines}"
         f"{footer}"
     )
 

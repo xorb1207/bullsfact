@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
-from typing import Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Optional, Sequence, TYPE_CHECKING
 
 import pandas as pd
 
 from backend.db import SessionLocal, crud
 from backend.db.models import ThresholdAlert
 from .market import MarketSnapshot
+
+if TYPE_CHECKING:
+    from .datasource.calendar_fetcher import CalendarFetcher
 
 log = logging.getLogger(__name__)
 
@@ -87,6 +90,7 @@ class AlertEvaluation:
     current_value: float
     threshold: float
     ref_value: Optional[float] = None        # 상대값 알림인 경우 기준점
+    calendar_contexts: list[str] = field(default_factory=list)  # M1: 이벤트 한 줄 컨텍스트
 
     def metric_label(self) -> str:
         if self.alert.metric_type == METRIC_PRICE:
@@ -114,7 +118,23 @@ class ThresholdAlertEvaluator:
     """
     스캐너 사이클당 1회 instantiation 권장.
     DB 세션은 매 호출마다 새로 열고 닫음 (SessionLocal scope 짧게).
+
+    M1: calendar_fetcher 주입 시 evaluation 결과에 이벤트 컨텍스트 한 줄 부착.
     """
+
+    def __init__(self, calendar_fetcher: Optional["CalendarFetcher"] = None):
+        self.calendar_fetcher = calendar_fetcher
+
+    def _calendar_contexts(self, ticker: Optional[str]) -> list[str]:
+        """ticker가 있으면 그 종목 + 매크로 컨텍스트, 없으면 매크로만."""
+        if self.calendar_fetcher is None:
+            return []
+        try:
+            # ticker가 None인 게이지 알림은 매크로만 받기 위해 빈 ticker로 호출
+            return self.calendar_fetcher.get_context_strings(ticker or "")
+        except Exception as e:
+            log.debug(f"[ThresholdEval] calendar context 실패 ({ticker}): {type(e).__name__}: {e}")
+            return []
 
     def evaluate_for_ticker(
         self,
@@ -124,6 +144,8 @@ class ThresholdAlertEvaluator:
     ) -> list[AlertEvaluation]:
         """이 ticker에 걸린 모든 활성 'price' 알림을 평가."""
         results: list[AlertEvaluation] = []
+        # 동일 ticker는 사이클당 같은 컨텍스트 — 한 번만 가져옴
+        cal_ctx = self._calendar_contexts(ticker)
         db = SessionLocal()
         try:
             alerts = crud.list_threshold_alerts(
@@ -142,6 +164,7 @@ class ThresholdAlertEvaluator:
                     current_value=current_price,
                     threshold=threshold,
                     ref_value=ref,
+                    calendar_contexts=list(cal_ctx),
                 ))
                 # 디버깅용 마지막 값 저장
                 crud.update_threshold_last_value(db, a.id, current_price)
@@ -152,6 +175,8 @@ class ThresholdAlertEvaluator:
     def evaluate_market_gauges(self, snap: MarketSnapshot) -> list[AlertEvaluation]:
         """MarketSnapshot에서 VIX/F&G 값을 뽑아 활성 알림과 비교."""
         results: list[AlertEvaluation] = []
+        # 게이지는 종목 무관 — 매크로 컨텍스트만 한 번 가져와서 공유
+        cal_ctx = self._calendar_contexts(None)
 
         # 메트릭별 현재값 추출
         values: dict[str, Optional[float]] = {
@@ -192,6 +217,7 @@ class ThresholdAlertEvaluator:
                         triggered=triggered,
                         current_value=current,
                         threshold=threshold,
+                        calendar_contexts=list(cal_ctx),
                     ))
                     crud.update_threshold_last_value(db, a.id, current)
         finally:
