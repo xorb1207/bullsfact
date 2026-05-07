@@ -22,6 +22,9 @@ from backend.core.datasource import DataProvider
 from backend.core.strategy import DipBuyStrategy
 from backend.core.alerter import AlertEngine
 from backend.core.scanner import Scanner
+from backend.core.threshold_alerts import ThresholdAlertEvaluator
+from backend.core.positions import PositionEvaluator
+from backend.core.market import MarketFetcher
 from backend.core.enrichment import LLMClient, LLMEnricher, Synthesizer
 from backend.core.enrichment.analysts import NewsAnalyst, FundamentalsAnalyst
 from backend.db import init_db, SessionLocal, crud
@@ -100,6 +103,10 @@ def build_pipeline() -> Pipeline:
         enricher=enricher,
     )
 
+    threshold_eval = ThresholdAlertEvaluator()
+    market_fetcher = MarketFetcher()
+    position_eval = PositionEvaluator()
+
     scanner = Scanner(
         data_provider=provider,
         strategy=strategy,
@@ -107,6 +114,9 @@ def build_pipeline() -> Pipeline:
         interval=os.getenv("DATA_INTERVAL", "1h"),
         period=os.getenv("DATA_PERIOD", "60d"),
         fallback_tickers=FALLBACK_TICKERS,
+        threshold_evaluator=threshold_eval,
+        market_fetcher=market_fetcher,
+        position_evaluator=position_eval,
     )
 
     return Pipeline(provider, strategy, llm, enricher, alerter, scanner)

@@ -20,7 +20,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable
+from typing import Callable, Optional
 
 import requests
 import schedule
@@ -34,6 +34,14 @@ from backend.core.strategy import DipBuyStrategy
 from backend.core.strategy.dip_buy import Signal, SignalStrength
 from backend.core.alerter import AlertEngine
 from backend.core.market import MarketFetcher, format_telegram as format_market
+from backend.core.macro_briefing import generate_daily_recap, format_for_telegram as format_macro
+from backend.core.on_demand import (
+    research_ticker, research_macro_now,
+    format_for_telegram as format_research,
+)
+from backend.core.enrichment.llm_client import LLMClient
+from backend.core.positions import MILESTONES, highest_passed_milestone
+from backend.core.money import format_money, format_money_signed, currency_for
 
 log = logging.getLogger("bot")
 logging.basicConfig(
@@ -51,6 +59,7 @@ class BotContext:
     strategy: DipBuyStrategy
     alerter: AlertEngine
     market: MarketFetcher
+    llm: Optional[LLMClient] = None         # 매크로 해설 / on-demand 분석에 사용
 
 
 # ──────────────────────────────────────────────
@@ -83,6 +92,28 @@ def _esc(s: str) -> str:
     return html.escape(s, quote=False)
 
 
+def _persist_llm_call(usage) -> None:
+    """LLM 호출 비용을 DB에 기록 — main.py와 동일 로직."""
+    db = SessionLocal()
+    try:
+        crud.insert_llm_call(
+            db,
+            model=usage.model,
+            purpose=usage.purpose or "unknown",
+            ticker=usage.ticker,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            cache_creation_tokens=usage.cache_creation_tokens,
+            cost_cents=round(usage.cost_usd() * 100, 4),
+            latency_ms=usage.latency_ms,
+        )
+    except Exception as e:
+        log.warning(f"[LLM persist] 실패 (무시): {e}")
+    finally:
+        db.close()
+
+
 def cmd_help(args: list[str], ctx: BotContext) -> str:
     return (
         "<b>bullsfact 봇 명령어</b>\n"
@@ -98,6 +129,13 @@ def cmd_help(args: list[str], ctx: BotContext) -> str:
         "  종목 삭제\n\n"
         "<b>/cost</b>\n"
         "  오늘/어제 LLM 비용 + 알람 카운트\n\n"
+        "<b>/alert</b>\n"
+        "  가격/VIX/F&G 임계치 알림 관리 (서브명령 안내)\n\n"
+        "<b>/position</b> (또는 /pos)\n"
+        "  보유 포지션 + 익절 룰 추적 (서브명령 안내)\n\n"
+        "<b>/why [TICKER]</b>\n"
+        "  왜 움직이는가 — LLM + 웹검색 해설\n"
+        "  인자 없으면 현재 매크로 상황 (~$0.05/회)\n\n"
         "<b>/test [TICKER]</b>\n"
         "  가짜 STRONG 알람 (raw, LLM 비용 0)\n\n"
         "<b>/help</b>\n"
@@ -117,8 +155,9 @@ def cmd_list(args: list[str], ctx: BotContext) -> str:
 
     rows = ["<b>워치리스트</b>", "━━━━━━━━━━━━━━━━━"]
     for w in items:
+        name_str = f"  <i>{_esc(w.name)}</i>" if w.name else ""
         if not w.active:
-            rows.append(f"⚪ {_esc(w.ticker)} ({w.source}) — 비활성")
+            rows.append(f"⚪ {_esc(w.ticker)} ({w.source}){name_str} — 비활성")
             continue
         try:
             df = ctx.provider.get_ohlcv(w.ticker, interval="1h", period="60d")
@@ -126,18 +165,31 @@ def cmd_list(args: list[str], ctx: BotContext) -> str:
             rsi = sig.indicators.get("rsi")
             rsi_str = f"{rsi:.1f}" if isinstance(rsi, float) and not math.isnan(rsi) else "N/A"
             emoji = {"strong": "🔴", "weak": "🟡", "none": "⚪"}.get(sig.strength.value, "⚪")
+            price_str = format_money(sig.price, w.ticker)
             rows.append(
-                f"{emoji} <b>{_esc(w.ticker)}</b> ({w.source}) "
-                f"${sig.price:.4g} | RSI {rsi_str} | {sig.strength.value}"
+                f"{emoji} <b>{_esc(w.ticker)}</b> ({w.source}){name_str} "
+                f"{price_str} | RSI {rsi_str} | {sig.strength.value}"
             )
         except Exception as e:
-            rows.append(f"⚠️ {_esc(w.ticker)}: {_esc(type(e).__name__)}")
+            rows.append(f"⚠️ {_esc(w.ticker)}{name_str}: {_esc(type(e).__name__)}")
     return "\n".join(rows)
+
+
+def _fetch_ticker_name(ticker: str, source: str) -> Optional[str]:
+    """yfinance.info에서 회사명 가져오기. 실패는 조용히 None."""
+    if source != "yfinance":
+        return None
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        return info.get("longName") or info.get("shortName")
+    except Exception:
+        return None
 
 
 def cmd_add(args: list[str], ctx: BotContext) -> str:
     if not args:
-        return "사용법: <code>/add TICKER</code> (예: /add NVDA, /add ETH/USDT)"
+        return "사용법: <code>/add TICKER</code> (예: /add NVDA, /add ETH/USDT, /add 005930.KS)"
     ticker = args[0].strip().upper()
     # 크립토 슬래시는 대소문자 보존 X — 포맷만 체크
     if "/" not in ticker and "-" not in ticker:
@@ -149,14 +201,16 @@ def cmd_add(args: list[str], ctx: BotContext) -> str:
         if existing:
             if existing.active:
                 return f"이미 등록됨: <b>{_esc(ticker)}</b>"
-            # 비활성이면 활성화. 없으면 add_watchlist에 active 인자 없음 → 단순 처리
             return f"이미 있음 (비활성): <b>{_esc(ticker)}</b> — 직접 활성화 필요"
         try:
             source = ctx.provider.source_of(ticker)
         except Exception:
             return f"⚠️ <b>{_esc(ticker)}</b> 라우팅 불가 — yfinance/binance 어느 쪽도 매칭 안 됨"
-        crud.add_watchlist(db, ticker=ticker, source=source)
-        return f"✅ 추가됨: <b>{_esc(ticker)}</b> ({source})"
+
+        name = _fetch_ticker_name(ticker, source)
+        crud.add_watchlist(db, ticker=ticker, source=source, name=name)
+        name_str = f"  <i>{_esc(name)}</i>" if name else ""
+        return f"✅ 추가됨: <b>{_esc(ticker)}</b> ({source}){name_str}"
     finally:
         db.close()
 
@@ -223,14 +277,474 @@ def cmd_market(args: list[str], ctx: BotContext) -> str:
 
 
 def send_market_report(ctx: BotContext) -> None:
-    """매일 자동 발송 (스케줄러 호출)."""
+    """매일 자동 발송 (스케줄러 호출). 시장 스냅샷 + LLM 매크로 해설."""
     try:
         log.info("[scheduler] 매일 시장 리포트 발송")
         snap = ctx.market.fetch()
         text = "🌅 <b>모닝 브리핑</b>\n\n" + format_market(snap)
+
+        # 매크로 해설 (LLM + web_search) — 실패해도 본 브리핑은 발송
+        if ctx.llm is not None:
+            try:
+                briefing = generate_daily_recap(ctx.llm, snap)
+                if briefing:
+                    text += "\n\n" + format_macro(briefing)
+                    log.info(f"[scheduler] 매크로 해설 추가 (cost ${briefing.cost_usd:.4f})")
+                else:
+                    log.warning("[scheduler] 매크로 해설 생성 실패 — 스킵")
+            except Exception as e:
+                log.error(f"[scheduler] 매크로 해설 예외 (무시): {type(e).__name__}: {e}")
+
         send(ctx, text)
     except Exception as e:
         log.error(f"[scheduler] 매일 시장 리포트 실패: {e}\n{traceback.format_exc()}")
+
+
+# ──────────────────────────────────────────────
+# /alert — ThresholdAlert 관리
+# ──────────────────────────────────────────────
+
+_ALERT_HELP = (
+    "<b>가격/지표 임계치 알림</b>\n"
+    "━━━━━━━━━━━━━━━━━\n"
+    "<b>/alert list</b>  활성 알림 목록\n"
+    "<b>/alert list all</b>  발동완료 포함 전체\n"
+    "<b>/alert remove ID</b>  삭제\n"
+    "<b>/alert pause ID</b>  / <b>resume ID</b>\n\n"
+    "<b>추가 — 가격 절대값:</b>\n"
+    "<code>/alert add price SOXL below 110 [T1] [HIGH] [메모]</code>\n\n"
+    "<b>추가 — 가격 상대값 (52주 고점 등):</b>\n"
+    "<code>/alert add price SOXL below high_252d -32% [T1] [HIGH] [메모]</code>\n"
+    "  ref: high_252d | low_252d | ema_50d\n\n"
+    "<b>추가 — VIX / F&G:</b>\n"
+    "<code>/alert add vix above 30 [MED]</code>\n"
+    "<code>/alert add fg_cnn below 25 [HIGH]</code>\n"
+    "<code>/alert add fg_crypto above 75</code>\n"
+)
+
+
+def _parse_priority(token: str) -> Optional[str]:
+    t = token.upper()
+    return t if t in ("HIGH", "MED", "LOW") else None
+
+
+def _parse_tier(token: str) -> Optional[str]:
+    t = token.upper()
+    return t if t in ("T1", "T2", "T3") else None
+
+
+def _parse_pct(token: str) -> Optional[float]:
+    """'-32%' 또는 '-0.32' 둘 다 받기."""
+    s = token.strip()
+    if s.endswith("%"):
+        try:
+            return float(s[:-1]) / 100.0
+        except ValueError:
+            return None
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    # 절대값이 1보다 크면 % 단위로 입력한 것으로 간주
+    return v / 100.0 if abs(v) > 1 else v
+
+
+_VALID_REF = {"high_252d", "low_252d", "ema_50d"}
+
+
+def _cmd_alert_add(args: list[str]) -> str:
+    """args[0]은 'add' 가 이미 빠진 상태. 즉 args = [metric_type, ...]."""
+    if not args:
+        return _ALERT_HELP
+    metric = args[0].lower()
+
+    db = SessionLocal()
+    try:
+        if metric == "price":
+            # /alert add price TICKER DIRECTION VALUE_OR_REF [PCT] [tier] [priority] [note...]
+            if len(args) < 4:
+                return "사용법: <code>/alert add price TICKER below 110</code> 또는\n<code>/alert add price TICKER below high_252d -32%</code>"
+            ticker = args[1].upper()
+            direction = args[2].lower()
+            third = args[3]
+
+            # 절대값 vs 상대값 구분
+            if third in _VALID_REF:
+                if len(args) < 5:
+                    return "상대값은 PCT 필요: <code>/alert add price SOXL below high_252d -32%</code>"
+                pct = _parse_pct(args[4])
+                if pct is None:
+                    return f"PCT 파싱 실패: <code>{_esc(args[4])}</code>"
+                kwargs = {"ref_window": third, "ref_pct": pct}
+                rest = args[5:]
+            else:
+                try:
+                    abs_v = float(third)
+                except ValueError:
+                    return f"가격 파싱 실패: <code>{_esc(third)}</code>"
+                kwargs = {"abs_value": abs_v}
+                rest = args[4:]
+
+            tier = None
+            priority = "MED"
+            note_parts: list[str] = []
+            for tok in rest:
+                if (t := _parse_tier(tok)):
+                    tier = t
+                elif (p := _parse_priority(tok)):
+                    priority = p
+                else:
+                    note_parts.append(tok)
+            note = " ".join(note_parts) if note_parts else None
+
+            row = crud.insert_threshold_alert(
+                db, metric_type="price", ticker=ticker, direction=direction,
+                tier=tier, priority=priority, note=note, **kwargs,
+            )
+            return f"✅ 알림 #{row.id} 등록: <b>{_esc(ticker)}</b> {direction} {_esc(args[3])}{('  ' + args[4]) if 'ref_window' in kwargs else ''}  [{priority}]{(' ' + tier) if tier else ''}"
+
+        if metric in ("vix", "fg_cnn", "fg_crypto"):
+            # /alert add METRIC DIRECTION VALUE [priority] [note...]
+            if len(args) < 3:
+                return f"사용법: <code>/alert add {metric} above 30</code>"
+            direction = args[1].lower()
+            try:
+                abs_v = float(args[2])
+            except ValueError:
+                return f"값 파싱 실패: <code>{_esc(args[2])}</code>"
+            priority = "MED"
+            note_parts: list[str] = []
+            for tok in args[3:]:
+                if (p := _parse_priority(tok)):
+                    priority = p
+                else:
+                    note_parts.append(tok)
+            note = " ".join(note_parts) if note_parts else None
+            row = crud.insert_threshold_alert(
+                db, metric_type=metric, direction=direction, abs_value=abs_v,
+                priority=priority, note=note,
+            )
+            return f"✅ 알림 #{row.id} 등록: <b>{metric.upper()}</b> {direction} {abs_v}  [{priority}]"
+
+        return f"알 수 없는 metric: <code>{_esc(metric)}</code>\n\n" + _ALERT_HELP
+    except ValueError as e:
+        return f"⚠️ {_esc(str(e))}"
+    finally:
+        db.close()
+
+
+def _format_alert_row(a) -> str:
+    pri_emoji = {"HIGH": "🔴", "MED": "🟡", "LOW": "🟢"}.get(a.priority, "⚪")
+    status = "" if a.active else " <i>(발동완료)</i>"
+    if a.metric_type == "price":
+        if a.abs_value is not None:
+            cond = f"{a.direction} ${a.abs_value:g}"
+        else:
+            cond = f"{a.direction} {a.ref_window} {a.ref_pct*100:+.1f}%"
+        head = f"{a.ticker}"
+        if a.tier:
+            head += f" {a.tier}"
+    else:
+        cond = f"{a.direction} {a.abs_value:g}"
+        head = a.metric_type.upper()
+    last = f"  현재≈{a.last_value:g}" if a.last_value is not None else ""
+    note = f"\n   📌 {_esc(a.note)}" if a.note else ""
+    return f"{pri_emoji} <b>#{a.id}</b> {_esc(head)} {_esc(cond)}{last}{status}{note}"
+
+
+def _cmd_alert_list(args: list[str]) -> str:
+    show_all = bool(args and args[0].lower() == "all")
+    db = SessionLocal()
+    try:
+        rows = crud.list_threshold_alerts(db, active_only=not show_all)
+    finally:
+        db.close()
+    if not rows:
+        return "등록된 알림 없음. <code>/alert</code> 로 사용법 확인."
+    header = "<b>알림 목록</b>" + (" (전체)" if show_all else " (활성)")
+    return header + "\n━━━━━━━━━━━━━━━━━\n" + "\n".join(_format_alert_row(r) for r in rows)
+
+
+def _cmd_alert_remove(args: list[str]) -> str:
+    if not args:
+        return "사용법: <code>/alert remove 42</code>"
+    try:
+        aid = int(args[0])
+    except ValueError:
+        return f"ID 파싱 실패: <code>{_esc(args[0])}</code>"
+    db = SessionLocal()
+    try:
+        ok = crud.delete_threshold_alert(db, aid)
+    finally:
+        db.close()
+    return f"🗑️ 알림 #{aid} 삭제됨" if ok else f"❌ 없음: #{aid}"
+
+
+def _cmd_alert_set_active(args: list[str], active: bool) -> str:
+    if not args:
+        return f"사용법: <code>/alert {'resume' if active else 'pause'} 42</code>"
+    try:
+        aid = int(args[0])
+    except ValueError:
+        return f"ID 파싱 실패: <code>{_esc(args[0])}</code>"
+    db = SessionLocal()
+    try:
+        ok = crud.set_threshold_active(db, aid, active)
+    finally:
+        db.close()
+    label = "재활성화" if active else "일시중지"
+    return f"✅ 알림 #{aid} {label}됨" if ok else f"❌ 없음: #{aid}"
+
+
+def cmd_alert(args: list[str], ctx: BotContext) -> str:
+    if not args:
+        return _ALERT_HELP
+    sub = args[0].lower()
+    rest = args[1:]
+    if sub == "list":
+        return _cmd_alert_list(rest)
+    if sub == "add":
+        return _cmd_alert_add(rest)
+    if sub in ("remove", "rm", "delete"):
+        return _cmd_alert_remove(rest)
+    if sub == "pause":
+        return _cmd_alert_set_active(rest, active=False)
+    if sub == "resume":
+        return _cmd_alert_set_active(rest, active=True)
+    if sub in ("help", "?"):
+        return _ALERT_HELP
+    return f"알 수 없는 하위 명령: <code>{_esc(sub)}</code>\n\n" + _ALERT_HELP
+
+
+# ──────────────────────────────────────────────
+# /position — 보유 포지션 + 익절 룰 추적
+# ──────────────────────────────────────────────
+
+_POSITION_HELP = (
+    "<b>보유 포지션 + 익절 룰</b>\n"
+    "━━━━━━━━━━━━━━━━━\n"
+    "<b>/position list</b>  현재 P&amp;L + 다음 마일스톤\n"
+    "<b>/position add TICKER QTY AVG_COST [메모]</b>\n"
+    "  예: <code>/position add SOXL 23 21.47</code>\n"
+    "  → 신규 추가. 이미 지나간 마일스톤은 자동 스킵 (알림 폭탄 방지)\n\n"
+    "<b>/position update TICKER QTY AVG_COST</b>\n"
+    "  수량/평단 갱신. <i>마일스톤은 0으로 초기화</i>\n\n"
+    "<b>/position remove TICKER</b>\n\n"
+    "<b>익절 룰 (참고):</b>\n"
+    "  +50% → 20% 매도 (누적 20%)\n"
+    "  +100% → 30% 매도 (누적 50%, 원금 회수)\n"
+    "  +200% → 25% 매도 (누적 75%)\n"
+    "  +400% → 15% 매도 (누적 90%)\n"
+    "  +600% → 재량 매도 (공짜 칩)\n"
+)
+
+
+def _next_milestone_label(highest: float, current_pct: float) -> str:
+    """포지션 리스트 출력용 — 다음 목표 표시."""
+    for ms, _, _, label in MILESTONES:
+        if ms > highest + 1e-9:
+            gap = (ms - current_pct) * 100
+            if gap > 0:
+                return f"다음: +{ms*100:.0f}% (까지 {gap:+.1f}%p)"
+            return f"다음: +{ms*100:.0f}% (도달, 곧 알림)"
+    return "최종 마일스톤 도달"
+
+
+def _cmd_position_list(ctx: BotContext) -> str:
+    db = SessionLocal()
+    try:
+        rows = crud.list_positions(db)
+        if not rows:
+            return "등록된 포지션 없음. <code>/position add TICKER QTY AVG_COST</code> 로 추가."
+        return _format_position_list(rows, db, ctx)
+    finally:
+        db.close()
+
+
+def _format_position_list(rows, db, ctx: BotContext) -> str:
+    lines = ["<b>보유 포지션</b>", "━━━━━━━━━━━━━━━━━"]
+    totals: dict[str, dict] = {}  # cur → {"value": float, "pnl": float}
+
+    for p in rows:
+        try:
+            df = ctx.provider.get_ohlcv(p.ticker, interval="1d", period="5d")
+            cur = float(df["close"].iloc[-1])
+        except Exception as e:
+            lines.append(f"⚠️ <b>{_esc(p.ticker)}</b>: {_esc(type(e).__name__)} (현재가 fetch 실패)")
+            continue
+
+        ret = (cur / p.avg_cost) - 1.0 if p.avg_cost > 0 else 0.0
+        pnl = (cur - p.avg_cost) * p.qty
+        value = cur * p.qty
+
+        cur_code = currency_for(p.ticker)
+        slot = totals.setdefault(cur_code, {"value": 0.0, "pnl": 0.0})
+        slot["value"] += value
+        slot["pnl"] += pnl
+
+        # 회사명 (Watchlist 캐시 활용)
+        wl = crud.get_watchlist_item(db, p.ticker)
+        name_str = f"  <i>{_esc(wl.name)}</i>" if wl and wl.name else ""
+
+        emoji = "🟢" if ret >= 0 else "🔴"
+        ms_str = _next_milestone_label(p.highest_milestone, ret)
+        notes_str = f"\n   📝 {_esc(p.notes)}" if p.notes else ""
+        qty_str = f"{p.qty:.4f}".rstrip("0").rstrip(".")
+
+        price_str = format_money(cur, p.ticker)
+        avg_str = format_money(p.avg_cost, p.ticker)
+        value_str = format_money(value, p.ticker)
+        pnl_str = format_money_signed(pnl, p.ticker)
+
+        lines.append(
+            f"{emoji} <b>{_esc(p.ticker)}</b>{name_str}  {ret*100:+.1f}%  "
+            f"({qty_str}주 × {price_str} = {value_str})\n"
+            f"   평단 {avg_str} | 손익 {pnl_str} | {_esc(ms_str)}"
+            f"{notes_str}"
+        )
+
+    lines.append("━━━━━━━━━━━━━━━━━")
+    if totals:
+        # 통화 1개면 단순 합계, 여러개면 통화별 분리
+        total_lines = []
+        for cur_code, slot in totals.items():
+            total_lines.append(
+                f"  {cur_code}: 평가액 {format_money(slot['value'], '_'+cur_code if cur_code!='USD' else '')}"
+                f" | 평가손익 {format_money_signed(slot['pnl'], '_'+cur_code if cur_code!='USD' else '')}"
+            )
+        # format_money는 ticker 기반이라 KRW 강제하려면 트릭 필요 — 간단히 직접
+        total_lines = []
+        for cur_code, slot in totals.items():
+            sym = {"USD": "$", "KRW": "₩", "JPY": "¥", "HKD": "HK$"}.get(cur_code, cur_code + " ")
+            v_fmt = f"{sym}{slot['value']:,.0f}" if cur_code in ("KRW", "JPY") else f"{sym}{slot['value']:,.2f}"
+            p_sign = "+" if slot["pnl"] >= 0 else "-"
+            p_abs = abs(slot["pnl"])
+            p_fmt = f"{p_sign}{sym}{p_abs:,.0f}" if cur_code in ("KRW", "JPY") else f"{p_sign}{sym}{p_abs:,.2f}"
+            total_lines.append(f"  {cur_code}: 평가액 {v_fmt} | 평가손익 {p_fmt}")
+        lines.append("<b>합계</b>:")
+        lines.extend(total_lines)
+    return "\n".join(lines)
+
+
+def _cmd_position_add(args: list[str], ctx: BotContext, *, force_milestone_zero: bool = False) -> str:
+    """/position add TICKER QTY AVG_COST [메모...]"""
+    if len(args) < 3:
+        return "사용법: <code>/position add SOXL 23 21.47 [메모]</code>"
+    ticker = args[0].upper()
+    try:
+        qty = float(args[1])
+        avg_cost = float(args[2])
+    except ValueError:
+        return f"수량/평단 파싱 실패: <code>{_esc(args[1])} {_esc(args[2])}</code>"
+    if qty <= 0 or avg_cost <= 0:
+        return "수량과 평단은 양수여야 함"
+
+    notes = " ".join(args[3:]) if len(args) > 3 else None
+
+    # 이미 지나간 마일스톤 자동 스킵 (알림 폭탄 방지)
+    skip_to = 0.0
+    if not force_milestone_zero:
+        try:
+            df = ctx.provider.get_ohlcv(ticker, interval="1d", period="5d")
+            cur = float(df["close"].iloc[-1])
+            cur_ret = (cur / avg_cost) - 1.0
+            skip_to = highest_passed_milestone(cur_ret)
+        except Exception as e:
+            log.warning(f"/position add {ticker} 현재가 fetch 실패: {e}")
+
+    db = SessionLocal()
+    try:
+        row = crud.upsert_position(
+            db, ticker=ticker, qty=qty, avg_cost=avg_cost,
+            highest_milestone=skip_to, notes=notes,
+        )
+    finally:
+        db.close()
+
+    qty_str = f"{qty:.4f}".rstrip("0").rstrip(".")
+    skip_str = f" (이미 +{skip_to*100:.0f}% 지나감 — 다음 마일스톤만 감시)" if skip_to > 0 else ""
+    return f"✅ 포지션 등록: <b>{_esc(ticker)}</b> {qty_str}주 @ ${avg_cost:.2f}{skip_str}"
+
+
+def _cmd_position_update(args: list[str], ctx: BotContext) -> str:
+    """qty/avg_cost 변경 시 마일스톤 0으로 초기화 (의도적 — 평단 바뀌었으니 재계산)."""
+    return _cmd_position_add(args, ctx, force_milestone_zero=False)
+    # 동작은 add와 동일. add 자체가 이미 지나간 마일스톤을 자동 스킵하므로 OK.
+
+
+def _cmd_position_remove(args: list[str]) -> str:
+    if not args:
+        return "사용법: <code>/position remove TICKER</code>"
+    ticker = args[0].upper()
+    db = SessionLocal()
+    try:
+        ok = crud.delete_position(db, ticker)
+    finally:
+        db.close()
+    return f"🗑️ 포지션 삭제: <b>{_esc(ticker)}</b>" if ok else f"❌ 없음: <b>{_esc(ticker)}</b>"
+
+
+def cmd_position(args: list[str], ctx: BotContext) -> str:
+    if not args:
+        return _POSITION_HELP
+    sub = args[0].lower()
+    rest = args[1:]
+    if sub == "list" or sub == "ls":
+        return _cmd_position_list(ctx)
+    if sub == "add":
+        return _cmd_position_add(rest, ctx)
+    if sub == "update":
+        return _cmd_position_update(rest, ctx)
+    if sub in ("remove", "rm", "delete"):
+        return _cmd_position_remove(rest)
+    if sub in ("help", "?"):
+        return _POSITION_HELP
+    return f"알 수 없는 하위 명령: <code>{_esc(sub)}</code>\n\n" + _POSITION_HELP
+
+
+# ──────────────────────────────────────────────
+# /why — 매크로/티커 해설 (LLM + web_search, on-demand)
+# ──────────────────────────────────────────────
+
+def cmd_why(args: list[str], ctx: BotContext) -> str:
+    """
+    /why            → 현재 시장 매크로 해설
+    /why TICKER     → 특정 종목 최근 동향 해설
+    """
+    if ctx.llm is None:
+        return ("⚠️ LLM 비활성 (ANTHROPIC_API_KEY 없음).\n"
+                "<code>backend/.env</code> 에 키 추가 후 봇 재시작.")
+
+    # 인자 없음 → 매크로 해설
+    if not args:
+        snap = ctx.market.fetch()
+        result = research_macro_now(ctx.llm, snap)
+        if not result:
+            return "⚠️ 해설 생성 실패 (API 과부하 또는 예산 초과). <code>/cost</code> 확인"
+        return format_research(result)
+
+    # /why TICKER
+    ticker_raw = args[0].strip()
+    ticker = ticker_raw.upper() if ("/" not in ticker_raw and "-" not in ticker_raw) else ticker_raw
+
+    # 일봉 OHLCV (최대 1년) — fetch 실패해도 LLM은 돌림
+    df = None
+    try:
+        df = ctx.provider.get_ohlcv(ticker, interval="1d", period="1y")
+    except Exception as e:
+        log.warning(f"/why {ticker} OHLCV fetch 실패: {type(e).__name__}: {e}")
+
+    # 매크로 스냅샷도 컨텍스트로 (실패해도 진행)
+    snap = None
+    try:
+        snap = ctx.market.fetch()
+    except Exception as e:
+        log.warning(f"/why {ticker} market snap 실패: {type(e).__name__}: {e}")
+
+    result = research_ticker(ctx.llm, ticker, df, snap)
+    if not result:
+        return f"⚠️ {_esc(ticker)} 해설 생성 실패 (API 과부하 또는 예산 초과)"
+    return format_research(result)
 
 
 def cmd_test(args: list[str], ctx: BotContext) -> str:
@@ -270,6 +784,10 @@ COMMANDS: dict[str, Callable[[list[str], BotContext], str]] = {
     "rm":     cmd_remove,
     "cost":   cmd_cost,
     "market": cmd_market,
+    "alert":  cmd_alert,
+    "position": cmd_position,
+    "pos":      cmd_position,
+    "why":    cmd_why,
     "test":   cmd_test,
 }
 
@@ -280,6 +798,9 @@ COMMAND_DESCRIPTIONS: list[tuple[str, str]] = [
     ("add",    "종목 추가 (예: /add NVDA)"),
     ("remove", "종목 삭제"),
     ("cost",   "LLM 비용 + 알람 카운트"),
+    ("alert",  "가격/VIX/F&G 임계치 알림 (/alert 로 사용법)"),
+    ("position", "보유 포지션 + 익절 룰 (/position 로 사용법)"),
+    ("why",    "왜 움직이는가 — /why TICKER 또는 /why (매크로)"),
     ("test",   "가짜 STRONG 알람 (헬스체크)"),
     ("help",   "명령어 목록"),
 ]
@@ -388,9 +909,22 @@ def main() -> None:
         enricher=None,            # /test 는 raw
     )
     market = MarketFetcher()
+
+    # LLMClient — 매크로 해설 / on-demand 분석용. ANTHROPIC_API_KEY 없으면 None.
+    llm: Optional[LLMClient] = None
+    if os.getenv("ANTHROPIC_API_KEY"):
+        llm = LLMClient(
+            max_daily_usd=float(os.getenv("MAX_DAILY_LLM_USD", "2.0")),
+            on_call=_persist_llm_call,
+        )
+        log.info("LLMClient 활성 — 매크로 해설/on-demand 사용 가능")
+    else:
+        log.info("ANTHROPIC_API_KEY 없음 — 매크로 해설 비활성")
+
     ctx = BotContext(
         token=token, allowed_chat_id=chat_id,
         provider=provider, strategy=strategy, alerter=alerter, market=market,
+        llm=llm,
     )
 
     register_commands(ctx)

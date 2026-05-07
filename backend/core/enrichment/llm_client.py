@@ -145,3 +145,67 @@ class LLMClient:
             except Exception as e:
                 log.warning(f"[LLM] on_call 콜백 실패 (무시): {e}")
         return text, usage
+
+    def call_with_web_search(
+        self,
+        model: str,
+        system: str,
+        user: str,
+        *,
+        max_tokens: int = 2048,
+        max_searches: int = 5,
+        purpose: str = "",
+        ticker: Optional[str] = None,
+    ) -> tuple[str, list[str], CallUsage]:
+        """
+        web_search 서버 툴을 켠 호출. Anthropic이 자동으로 검색 실행, 결과를 본문에 통합.
+        Returns: (text, citation_urls, usage)
+
+        주의: web_search는 토큰 외 검색 비용 별도 ($10/1k searches @ 2026-05).
+              여기서는 일반 토큰 비용만 추적 — 검색 비용은 캡 외에 발생함을 인지할 것.
+        """
+        self._check_and_reset_budget()
+        client = self._ensure_client()
+
+        t0 = time.monotonic()
+        resp = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            tools=[{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": max_searches,
+            }],
+            messages=[{"role": "user", "content": user}],
+        )
+        latency_ms = int((time.monotonic() - t0) * 1000)
+
+        text_parts: list[str] = []
+        citations: list[str] = []
+        for block in resp.content:
+            if block.type == "text":
+                text_parts.append(block.text)
+                for cit in (getattr(block, "citations", None) or []):
+                    url = getattr(cit, "url", None)
+                    if url and url not in citations:
+                        citations.append(url)
+        text = "".join(text_parts)
+
+        usage = CallUsage(
+            model=model,
+            input_tokens=resp.usage.input_tokens,
+            output_tokens=resp.usage.output_tokens,
+            cache_read_tokens=getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
+            cache_creation_tokens=getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
+            purpose=purpose,
+            ticker=ticker,
+            latency_ms=latency_ms,
+        )
+        self._record_spend(usage)
+        if self._on_call:
+            try:
+                self._on_call(usage)
+            except Exception as e:
+                log.warning(f"[LLM] on_call 콜백 실패 (무시): {e}")
+        return text, citations, usage

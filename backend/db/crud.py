@@ -7,7 +7,7 @@ from typing import Optional, Sequence
 from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 
-from .models import Watchlist, AlertLog, BacktestResult, LLMCallLog
+from .models import Watchlist, AlertLog, BacktestResult, LLMCallLog, ThresholdAlert, Position
 
 
 # ──────────────────────────────────────────────
@@ -28,19 +28,30 @@ def get_watchlist_item(db: Session, ticker: str) -> Optional[Watchlist]:
     ).scalar_one_or_none()
 
 
-def add_watchlist(db: Session, ticker: str, source: str) -> Watchlist:
+def add_watchlist(db: Session, ticker: str, source: str, name: Optional[str] = None) -> Watchlist:
     existing = get_watchlist_item(db, ticker)
     if existing:
         existing.active = True
         existing.source = source
+        if name and not existing.name:
+            existing.name = name
         db.commit()
         db.refresh(existing)
         return existing
-    item = Watchlist(ticker=ticker, source=source, active=True)
+    item = Watchlist(ticker=ticker, source=source, name=name, active=True)
     db.add(item)
     db.commit()
     db.refresh(item)
     return item
+
+
+def update_watchlist_name(db: Session, ticker: str, name: str) -> bool:
+    item = get_watchlist_item(db, ticker)
+    if not item:
+        return False
+    item.name = name
+    db.commit()
+    return True
 
 
 def remove_watchlist(db: Session, ticker: str) -> bool:
@@ -149,6 +160,209 @@ def list_backtests(db: Session, ticker: Optional[str] = None, limit: int = 20) -
         stmt = stmt.where(BacktestResult.ticker == ticker)
     stmt = stmt.order_by(BacktestResult.created_at.desc()).limit(limit)
     return db.execute(stmt).scalars().all()
+
+
+# ──────────────────────────────────────────────
+# Position
+# ──────────────────────────────────────────────
+
+def list_positions(db: Session) -> Sequence[Position]:
+    return db.execute(
+        select(Position).order_by(Position.added_at.asc())
+    ).scalars().all()
+
+
+def get_position(db: Session, ticker: str) -> Optional[Position]:
+    return db.execute(
+        select(Position).where(Position.ticker == ticker)
+    ).scalar_one_or_none()
+
+
+def upsert_position(
+    db: Session,
+    *,
+    ticker: str,
+    qty: float,
+    avg_cost: float,
+    highest_milestone: float = 0.0,
+    notes: Optional[str] = None,
+) -> Position:
+    """있으면 갱신 (qty/avg_cost/notes/highest_milestone 모두), 없으면 추가."""
+    row = get_position(db, ticker)
+    if row:
+        row.qty = qty
+        row.avg_cost = avg_cost
+        row.highest_milestone = highest_milestone
+        if notes is not None:
+            row.notes = notes
+    else:
+        row = Position(
+            ticker=ticker, qty=qty, avg_cost=avg_cost,
+            highest_milestone=highest_milestone, notes=notes,
+        )
+        db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def update_position_milestone(db: Session, ticker: str, milestone: float) -> Optional[Position]:
+    row = get_position(db, ticker)
+    if not row:
+        return None
+    row.highest_milestone = milestone
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def delete_position(db: Session, ticker: str) -> bool:
+    row = get_position(db, ticker)
+    if not row:
+        return False
+    db.delete(row)
+    db.commit()
+    return True
+
+
+# ──────────────────────────────────────────────
+# ThresholdAlert
+# ──────────────────────────────────────────────
+
+def list_threshold_alerts(
+    db: Session,
+    *,
+    active_only: bool = True,
+    metric_type: Optional[str] = None,
+    ticker: Optional[str] = None,
+) -> Sequence[ThresholdAlert]:
+    stmt = select(ThresholdAlert)
+    if active_only:
+        stmt = stmt.where(ThresholdAlert.active.is_(True))
+    if metric_type:
+        stmt = stmt.where(ThresholdAlert.metric_type == metric_type)
+    if ticker:
+        stmt = stmt.where(ThresholdAlert.ticker == ticker)
+    stmt = stmt.order_by(ThresholdAlert.created_at.asc())
+    return db.execute(stmt).scalars().all()
+
+
+def get_threshold_alert(db: Session, alert_id: int) -> Optional[ThresholdAlert]:
+    return db.get(ThresholdAlert, alert_id)
+
+
+def insert_threshold_alert(
+    db: Session,
+    *,
+    metric_type: str,
+    direction: str,
+    ticker: Optional[str] = None,
+    abs_value: Optional[float] = None,
+    ref_window: Optional[str] = None,
+    ref_pct: Optional[float] = None,
+    tier: Optional[str] = None,
+    priority: str = "MED",
+    note: Optional[str] = None,
+    re_arm_after_h: Optional[int] = None,
+) -> ThresholdAlert:
+    if abs_value is None and (ref_window is None or ref_pct is None):
+        raise ValueError("abs_value 또는 (ref_window + ref_pct) 둘 중 하나는 필수")
+    if abs_value is not None and (ref_window is not None or ref_pct is not None):
+        raise ValueError("abs_value 와 (ref_window/ref_pct)는 동시에 지정 불가")
+    if direction not in ("above", "below"):
+        raise ValueError(f"direction은 'above'|'below' 중 하나: {direction}")
+    if metric_type == "price" and not ticker:
+        raise ValueError("metric_type='price'는 ticker 필수")
+
+    row = ThresholdAlert(
+        metric_type=metric_type,
+        ticker=ticker,
+        direction=direction,
+        abs_value=abs_value,
+        ref_window=ref_window,
+        ref_pct=ref_pct,
+        tier=tier,
+        priority=priority,
+        note=note,
+        re_arm_after_h=re_arm_after_h,
+        active=True,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def mark_threshold_triggered(
+    db: Session,
+    alert_id: int,
+    *,
+    last_value: float,
+) -> Optional[ThresholdAlert]:
+    row = db.get(ThresholdAlert, alert_id)
+    if not row:
+        return None
+    row.triggered_at = datetime.utcnow()
+    row.last_value = last_value
+    row.active = False
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def update_threshold_last_value(
+    db: Session,
+    alert_id: int,
+    value: float,
+) -> None:
+    """디버깅/모니터링용 — 매 평가 사이클마다 현재값 저장."""
+    row = db.get(ThresholdAlert, alert_id)
+    if not row:
+        return
+    row.last_value = value
+    db.commit()
+
+
+def set_threshold_active(db: Session, alert_id: int, active: bool) -> bool:
+    row = db.get(ThresholdAlert, alert_id)
+    if not row:
+        return False
+    row.active = active
+    if active:
+        row.triggered_at = None
+    db.commit()
+    return True
+
+
+def delete_threshold_alert(db: Session, alert_id: int) -> bool:
+    row = db.get(ThresholdAlert, alert_id)
+    if not row:
+        return False
+    db.delete(row)
+    db.commit()
+    return True
+
+
+def re_arm_due_alerts(db: Session) -> int:
+    """re_arm_after_h가 설정된 발동 완료 알림 중, 시간 경과한 것 자동 재활성화. 재활성화 개수 반환."""
+    from datetime import timedelta
+    now = datetime.utcnow()
+    candidates = db.execute(
+        select(ThresholdAlert).where(
+            ThresholdAlert.active.is_(False),
+            ThresholdAlert.re_arm_after_h.isnot(None),
+            ThresholdAlert.triggered_at.isnot(None),
+        )
+    ).scalars().all()
+    count = 0
+    for row in candidates:
+        if row.triggered_at + timedelta(hours=row.re_arm_after_h) <= now:
+            row.active = True
+            row.triggered_at = None
+            count += 1
+    if count:
+        db.commit()
+    return count
 
 
 # ──────────────────────────────────────────────

@@ -23,6 +23,24 @@ Base = declarative_base()
 def init_db() -> None:
     from . import models  # noqa: F401  — 테이블 등록을 위해 import
     Base.metadata.create_all(bind=engine)
+    _run_lightweight_migrations()
+
+
+def _run_lightweight_migrations() -> None:
+    """
+    SQLite는 ALTER TABLE 일부 지원 — 신규 컬럼 추가만 idempotent하게 처리.
+    Alembic 도입 전까지의 임시 솔루션.
+    """
+    from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+    existing_tables = inspector.get_table_names()
+
+    # watchlist.name 추가 (없으면)
+    if "watchlist" in existing_tables:
+        cols = {c["name"] for c in inspector.get_columns("watchlist")}
+        if "name" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE watchlist ADD COLUMN name VARCHAR(128)"))
 
 
 def get_db():
