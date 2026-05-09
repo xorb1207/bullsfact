@@ -7,7 +7,7 @@ from typing import Optional, Sequence
 from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 
-from .models import Watchlist, AlertLog, BacktestResult, LLMCallLog, ThresholdAlert, Position
+from .models import Watchlist, AlertLog, BacktestResult, LLMCallLog, ThresholdAlert, Position, EventCalibration
 
 
 # ──────────────────────────────────────────────
@@ -363,6 +363,71 @@ def re_arm_due_alerts(db: Session) -> int:
     if count:
         db.commit()
     return count
+
+
+# ──────────────────────────────────────────────
+# EventCalibration
+# ──────────────────────────────────────────────
+
+def upsert_event_calibration(
+    db: Session,
+    *,
+    event_type: str,
+    ticker: str,
+    rsi_threshold: float,
+    hit_rate: float,
+    sample_count: int,
+    forward_days: int = 5,
+    target_return: float = 0.02,
+    lookback_days: int = 730,
+    bb_std: Optional[float] = None,
+) -> EventCalibration:
+    existing = db.execute(
+        select(EventCalibration).where(
+            EventCalibration.event_type == event_type,
+            EventCalibration.ticker == ticker,
+        )
+    ).scalar_one_or_none()
+    if existing:
+        existing.rsi_threshold = rsi_threshold
+        existing.hit_rate = hit_rate
+        existing.sample_count = sample_count
+        existing.forward_days = forward_days
+        existing.target_return = target_return
+        existing.lookback_days = lookback_days
+        existing.bb_std = bb_std
+        existing.last_calibrated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(existing)
+        return existing
+    row = EventCalibration(
+        event_type=event_type, ticker=ticker, rsi_threshold=rsi_threshold,
+        hit_rate=hit_rate, sample_count=sample_count, forward_days=forward_days,
+        target_return=target_return, lookback_days=lookback_days, bb_std=bb_std,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def get_event_calibration(
+    db: Session, event_type: str, ticker: str,
+) -> Optional[EventCalibration]:
+    return db.execute(
+        select(EventCalibration).where(
+            EventCalibration.event_type == event_type,
+            EventCalibration.ticker == ticker,
+        )
+    ).scalar_one_or_none()
+
+
+def list_event_calibrations(db: Session) -> Sequence[EventCalibration]:
+    return db.execute(
+        select(EventCalibration).order_by(
+            EventCalibration.event_type.asc(), EventCalibration.ticker.asc()
+        )
+    ).scalars().all()
 
 
 # ──────────────────────────────────────────────

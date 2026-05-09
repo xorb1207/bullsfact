@@ -112,6 +112,33 @@ class ThresholdAlert(Base):
 Index("ix_threshold_alert_active_metric", ThresholdAlert.active, ThresholdAlert.metric_type)
 
 
+class EventCalibration(Base):
+    """
+    이벤트별 RSI 임계치 캘리브레이션 결과 (M2-A).
+
+    grid search 로 산출된 "이벤트 X 임박 시 적중률 최고 RSI" 저장.
+    스캐너가 시그널 생성 시 이 테이블 참조해 RSI threshold 동적 교체.
+
+    적중률 정의: 시그널 발생일 D 에서 D+forward_days 종가가 +target_return% 이상.
+    """
+    __tablename__ = "event_calibration"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_type = Column(String(16), nullable=False, index=True)   # "cpi" | "fomc" | "nfp"
+    ticker = Column(String(32), nullable=False, index=True)
+    rsi_threshold = Column(Float, nullable=False)                 # grid search 결과
+    bb_std = Column(Float, nullable=True)                          # 향후 확장 (현재 미사용)
+    hit_rate = Column(Float, nullable=False)                       # 0~1
+    sample_count = Column(Integer, nullable=False)                 # 평가 사이클 수
+    forward_days = Column(Integer, nullable=False, default=5)
+    target_return = Column(Float, nullable=False, default=0.02)
+    lookback_days = Column(Integer, nullable=False, default=730)   # 백테스트 기간
+    last_calibrated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+Index("ix_event_calibration_event_ticker", EventCalibration.event_type, EventCalibration.ticker)
+
+
 class LLMCallLog(Base):
     """Synthesizer/Analyst의 LLM 호출 기록. 일일 비용 리포트에서 집계."""
     __tablename__ = "llm_call_log"

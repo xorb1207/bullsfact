@@ -43,6 +43,7 @@ from backend.core.enrichment.llm_client import LLMClient
 from backend.core.positions import MILESTONES, highest_passed_milestone
 from backend.core.money import format_money, format_money_signed, currency_for
 from backend.core.datasource.calendar_fetcher import CalendarFetcher
+from backend.core.exposure import compute_exposure, PortfolioExposure
 
 log = logging.getLogger("bot")
 logging.basicConfig(
@@ -135,13 +136,17 @@ def cmd_help(args: list[str], ctx: BotContext) -> str:
         "  가격/VIX/F&G 임계치 알림 관리 (서브명령 안내)\n\n"
         "<b>/position</b> (또는 /pos)\n"
         "  보유 포지션 + 익절 룰 추적 (서브명령 안내)\n\n"
+        "<b>/exposure</b> (또는 /expo)\n"
+        "  포트폴리오 SPY/SOXX 베타 + R² (집중도 진단)\n\n"
         "<b>/why [TICKER]</b>\n"
         "  왜 움직이는가 — LLM + 웹검색 해설\n"
         "  인자 없으면 현재 매크로 상황 (~$0.05/회)\n\n"
         "<b>/test [TICKER]</b>\n"
         "  가짜 STRONG 알람 (raw, LLM 비용 0)\n\n"
         "<b>/help</b>\n"
-        "  이 메시지\n"
+        "  이 메시지\n\n"
+        "<i>💡 /position add 와 /alert add 는 멀티라인 일괄 입력 지원\n"
+        "(첫 줄에 명령, 다음 줄마다 인자)</i>\n"
     )
 
 
@@ -757,8 +762,23 @@ def _format_position_list(rows, db, ctx: BotContext) -> str:
     return "\n".join(lines)
 
 
-def _cmd_position_add(args: list[str], ctx: BotContext, *, force_milestone_zero: bool = False) -> str:
-    """/position add TICKER QTY AVG_COST [메모...]"""
+def _cmd_position_add(
+    args: list[str],
+    ctx: BotContext,
+    *,
+    force_milestone_zero: bool = False,
+    allow_overwrite: bool = False,
+) -> str:
+    """
+    /position add TICKER QTY AVG_COST [메모...]
+
+    중복 정책 (allow_overwrite=False, /position add 기본):
+      - 동일 ticker + 동일 qty/avg_cost  → 스킵 (idempotent)
+      - 동일 ticker + 다른 qty/avg_cost → 거부 (기존값 보존, /position update 안내)
+      - 신규 ticker                       → 추가
+
+    /position update 는 allow_overwrite=True 로 호출 → 항상 덮어씀.
+    """
     if len(args) < 3:
         return "사용법: <code>/position add SOXL 23 21.47 [메모]</code>"
     ticker = args[0].upper()
@@ -771,6 +791,26 @@ def _cmd_position_add(args: list[str], ctx: BotContext, *, force_milestone_zero:
         return "수량과 평단은 양수여야 함"
 
     notes = " ".join(args[3:]) if len(args) > 3 else None
+
+    # 중복 검사
+    db = SessionLocal()
+    try:
+        existing = crud.get_position(db, ticker)
+    finally:
+        db.close()
+
+    if existing is not None and not allow_overwrite:
+        same_qty = abs(existing.qty - qty) < 1e-9
+        same_avg = abs(existing.avg_cost - avg_cost) < 1e-9
+        same_notes = (existing.notes or "") == (notes or "")
+        if same_qty and same_avg and same_notes:
+            return f"⚪ 이미 등록됨 (동일): <b>{_esc(ticker)}</b>"
+        # 다른 값 — 거부, 기존값 보존
+        return (
+            f"⚠️ 이미 있음: <b>{_esc(ticker)}</b> "
+            f"기존 {existing.qty:g}주 @ ${existing.avg_cost:.2f}\n"
+            f"   갱신하려면 <code>/position update {ticker} {qty:g} {avg_cost}</code>"
+        )
 
     # 이미 지나간 마일스톤 자동 스킵 (알림 폭탄 방지)
     skip_to = 0.0
@@ -785,7 +825,7 @@ def _cmd_position_add(args: list[str], ctx: BotContext, *, force_milestone_zero:
 
     db = SessionLocal()
     try:
-        row = crud.upsert_position(
+        crud.upsert_position(
             db, ticker=ticker, qty=qty, avg_cost=avg_cost,
             highest_milestone=skip_to, notes=notes,
         )
@@ -794,13 +834,13 @@ def _cmd_position_add(args: list[str], ctx: BotContext, *, force_milestone_zero:
 
     qty_str = f"{qty:.4f}".rstrip("0").rstrip(".")
     skip_str = f" (이미 +{skip_to*100:.0f}% 지나감 — 다음 마일스톤만 감시)" if skip_to > 0 else ""
-    return f"✅ 포지션 등록: <b>{_esc(ticker)}</b> {qty_str}주 @ ${avg_cost:.2f}{skip_str}"
+    action = "갱신" if existing is not None else "등록"
+    return f"✅ 포지션 {action}: <b>{_esc(ticker)}</b> {qty_str}주 @ ${avg_cost:.2f}{skip_str}"
 
 
 def _cmd_position_update(args: list[str], ctx: BotContext) -> str:
-    """qty/avg_cost 변경 시 마일스톤 0으로 초기화 (의도적 — 평단 바뀌었으니 재계산)."""
-    return _cmd_position_add(args, ctx, force_milestone_zero=False)
-    # 동작은 add와 동일. add 자체가 이미 지나간 마일스톤을 자동 스킵하므로 OK.
+    """명시적 갱신 — 기존 값을 항상 덮어쓰고 마일스톤도 재계산."""
+    return _cmd_position_add(args, ctx, allow_overwrite=True)
 
 
 def _cmd_position_remove(args: list[str]) -> str:
@@ -831,6 +871,90 @@ def cmd_position(args: list[str], ctx: BotContext) -> str:
     if sub in ("help", "?"):
         return _POSITION_HELP
     return f"알 수 없는 하위 명령: <code>{_esc(sub)}</code>\n\n" + _POSITION_HELP
+
+
+# ──────────────────────────────────────────────
+# /exposure — 포트폴리오 베타 + R² (M2-B)
+# ──────────────────────────────────────────────
+
+def _fmt_metric(beta: Optional[float], r2: Optional[float]) -> str:
+    if beta is None or r2 is None:
+        return "데이터 부족"
+    return f"β {beta:+.2f}  ·  R² {r2:.2f}"
+
+
+def _r2_indicator(r2: Optional[float]) -> str:
+    """R² 강도 시각화."""
+    if r2 is None:
+        return ""
+    if r2 >= 0.90:
+        return "🔴"   # 강한 동조 (분산 효과 거의 없음)
+    if r2 >= 0.70:
+        return "🟡"   # 중간 동조
+    return "🟢"       # 약한 동조 (분산 효과 있음)
+
+
+def _format_exposure(expo: PortfolioExposure) -> str:
+    bench_syms = [s for s, _ in expo.benchmarks]
+    lines = [
+        "<b>📊 포트폴리오 노출도</b>  <i>🟢약 · 🟡중 · 🔴강 동조</i>",
+        "━━━━━━━━━━━━━━━━━",
+        f"벤치마크: {' · '.join(s for s, _ in expo.benchmarks)} (1년 일봉, β = 민감도 / R² = 동조도)",
+        "",
+    ]
+
+    # 종목별 (가중치 큰 순)
+    sorted_tx = sorted(expo.tickers, key=lambda t: expo.weights.get(t.ticker, 0), reverse=True)
+    for tx in sorted_tx:
+        weight_pct = expo.weights.get(tx.ticker, 0) * 100
+        ret_str = f"{tx.return_pct*100:+.1f}%"
+        cur_tag = "" if tx.currency == "USD" else f" <i>({tx.currency})</i>"
+        lines.append(
+            f"<b>{_esc(tx.ticker)}</b>{cur_tag}  "
+            f"비중 <b>{weight_pct:.1f}%</b>  ·  {ret_str}"
+        )
+        for sym in bench_syms:
+            beta, r2 = tx.metrics.get(sym, (None, None))
+            indicator = _r2_indicator(r2)
+            lines.append(f"   {sym:5s} {_fmt_metric(beta, r2)}  {indicator}")
+
+    # 포트폴리오 합계
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append("<b>포트폴리오 종합</b>")
+    for sym, _ in expo.benchmarks:
+        beta, r2 = expo.portfolio_metrics.get(sym, (None, None))
+        indicator = _r2_indicator(r2)
+        lines.append(f"  {sym:5s} {_fmt_metric(beta, r2)}  {indicator}")
+
+    if expo.warnings:
+        lines.append("")
+        for w in expo.warnings:
+            lines.append(f"⚠️ {_esc(w)}")
+
+    return "\n".join(lines)
+
+
+def cmd_exposure(args: list[str], ctx: BotContext) -> str:
+    db = SessionLocal()
+    try:
+        positions = crud.list_positions(db)
+    finally:
+        db.close()
+    if not positions:
+        return ("등록된 포지션 없음.\n"
+                "<code>/position add SOXL 23 21.47</code> 로 추가 후 재호출.")
+
+    try:
+        expo = compute_exposure(ctx.provider, positions)
+    except Exception as e:
+        log.error(f"[/exposure] 계산 실패: {type(e).__name__}: {e}")
+        return f"⚠️ 노출도 계산 실패: <code>{_esc(type(e).__name__)}</code>"
+
+    if expo is None:
+        return "⚠️ 노출도 계산 실패 — 데이터 부족 또는 벤치마크 fetch 실패"
+
+    return _format_exposure(expo)
 
 
 # ──────────────────────────────────────────────
@@ -926,6 +1050,8 @@ COMMANDS: dict[str, Callable[[list[str], BotContext], str]] = {
     "alert":  cmd_alert,
     "position": cmd_position,
     "pos":      cmd_position,
+    "exposure": cmd_exposure,
+    "expo":     cmd_exposure,
     "why":    cmd_why,
     "test":   cmd_test,
 }
@@ -939,6 +1065,7 @@ COMMAND_DESCRIPTIONS: list[tuple[str, str]] = [
     ("cost",   "LLM 비용 + 알람 카운트"),
     ("alert",  "가격/VIX/F&G 임계치 알림 (/alert 로 사용법)"),
     ("position", "보유 포지션 + 익절 룰 (/position 로 사용법)"),
+    ("exposure", "포트폴리오 베타 + R² (SPY/SOXX 동조도)"),
     ("why",    "왜 움직이는가 — /why TICKER 또는 /why (매크로)"),
     ("test",   "가짜 STRONG 알람 (헬스체크)"),
     ("help",   "명령어 목록"),
@@ -986,6 +1113,81 @@ def _start_daily_scheduler(ctx: BotContext) -> None:
 # 폴링 루프
 # ──────────────────────────────────────────────
 
+def _try_multiline_bulk(text: str, ctx: BotContext) -> Optional[str]:
+    """
+    멀티라인 메시지 일괄 처리.
+
+    지원 패턴 (첫 줄에 명령, 이후 줄마다 인자):
+      /position add [TICKER QTY AVG_COST [메모]]
+      LINE2 ...
+      LINE3 ...
+
+      /alert add [...]
+      LINE2 ...
+
+    매칭 안 되면 None 반환 → 일반 처리 흐름.
+    """
+    if "\n" not in text:
+        return None
+    lines = [l for l in (line.strip() for line in text.split("\n")) if l]
+    if len(lines) < 2:
+        return None
+
+    first = lines[0]
+    if not first.startswith("/"):
+        return None
+    first_parts = first[1:].split()
+    if len(first_parts) < 2:
+        return None
+    cmd = first_parts[0].split("@")[0].lower()
+    sub = first_parts[1].lower()
+
+    # /position add (또는 /pos add)
+    if cmd in ("position", "pos") and sub == "add":
+        results: list[str] = []
+        # 첫 줄에 인자가 더 있으면 그것도 처리 (e.g. "/position add SOXL 23 21.47")
+        first_extra = first_parts[2:]
+        if first_extra:
+            results.append(_cmd_position_add(first_extra, ctx))
+        for line in lines[1:]:
+            tokens = line.split()
+            if not tokens:
+                continue
+            results.append(_cmd_position_add(tokens, ctx))
+        return _summarize_bulk(results, label="포지션")
+
+    # /alert add price ... (멀티라인은 'price' 모드에서만 의미. vix/fg는 단발이라 굳이)
+    if cmd == "alert" and sub == "add":
+        results = []
+        first_extra = first_parts[2:]
+        if first_extra:
+            results.append(_cmd_alert_add(first_extra))
+        for line in lines[1:]:
+            tokens = line.split()
+            if not tokens:
+                continue
+            results.append(_cmd_alert_add(tokens))
+        return _summarize_bulk(results, label="알림")
+
+    return None
+
+
+def _summarize_bulk(results: list[str], label: str) -> str:
+    """일괄 처리 결과 — 성공/스킵/실패 카운트 + 각 라인 응답."""
+    if not results:
+        return f"⚠️ {label} 입력 라인 0건"
+    ok = sum(1 for r in results if r.startswith("✅"))
+    skipped = sum(1 for r in results if r.startswith("⚪"))
+    fail = len(results) - ok - skipped
+    parts = [f"✅ {ok}건"]
+    if skipped:
+        parts.append(f"⚪ {skipped}건")
+    if fail:
+        parts.append(f"⚠️ {fail}건")
+    head = f"<b>{label} 일괄 처리</b>: " + " / ".join(parts)
+    return head + "\n━━━━━━━━━━━━━━━━━\n" + "\n".join(results)
+
+
 def _process_update(update: dict, ctx: BotContext) -> None:
     msg = update.get("message") or update.get("edited_message")
     if not msg:
@@ -1003,6 +1205,12 @@ def _process_update(update: dict, ctx: BotContext) -> None:
 
     if not text.startswith("/"):
         return  # 명령어 아니면 무시
+
+    # 멀티라인 일괄 처리 (/position add, /alert add) 시도
+    bulk_reply = _try_multiline_bulk(text, ctx)
+    if bulk_reply is not None:
+        send(ctx, bulk_reply)
+        return
 
     parts = text[1:].split()
     cmd = parts[0].split("@")[0].lower()  # /add@bot_name 같은 형태 정리

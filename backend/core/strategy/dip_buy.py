@@ -99,6 +99,43 @@ class DipBuyStrategy(BaseStrategy):
 
         return df
 
+    def _effective_rsi_threshold(self, ticker: str) -> tuple[float, Optional[str]]:
+        """
+        M2-A: 캘린더 임박 이벤트가 있으면 DB calibration 조회.
+        Returns: (effective_threshold, label_for_reason)
+        label = None 이면 default 사용.
+        """
+        if self.calendar_fetcher is None:
+            return self.rsi_threshold, None
+        try:
+            events = self.calendar_fetcher.get_events(ticker, lookahead_days=3)
+        except Exception:
+            return self.rsi_threshold, None
+        # 매크로 이벤트 우선 (cpi/nfp/fomc), 임박 (D-3 이내)
+        macro = [e for e in events if e.event_type in ("cpi", "nfp", "fomc")
+                 and 0 <= e.days_until <= 3]
+        if not macro:
+            return self.rsi_threshold, None
+        # 가장 임박한 이벤트 선택
+        ev = min(macro, key=lambda e: e.days_until)
+        try:
+            from backend.db import SessionLocal, crud
+            db = SessionLocal()
+            try:
+                cal = crud.get_event_calibration(db, ev.event_type, ticker)
+            finally:
+                db.close()
+        except Exception as e:
+            log.debug(f"[DipBuy] calibration 조회 실패 ({ticker}/{ev.event_type}): {e}")
+            return self.rsi_threshold, None
+        if cal is None:
+            return self.rsi_threshold, None
+        label = (
+            f"이벤트 임박 보정: {ev.event_type.upper()} D-{ev.days_until} → "
+            f"RSI<{cal.rsi_threshold} (적중 {cal.hit_rate*100:.0f}%, n={cal.sample_count})"
+        )
+        return float(cal.rsi_threshold), label
+
     def generate_signal(self, df: pd.DataFrame, ticker: str) -> Signal:
         df = self.populate_indicators(df)
         last = df.iloc[-1]
@@ -109,20 +146,29 @@ class DipBuyStrategy(BaseStrategy):
         bb_mid   = float(last.get("bb_mid",   float("nan")))
         bb_upper = float(last.get("bb_upper", float("nan")))
 
-        reasons: list[str] = []
+        # 실제 매수 조건 (강도 판정용 — context 라인은 여기 안 들어감)
+        condition_reasons: list[str] = []
 
-        if not pd.isna(rsi) and rsi < self.rsi_threshold:
-            reasons.append(f"RSI={rsi:.1f} < {self.rsi_threshold}")
+        # M2-A: 이벤트 임박 시 calibrated threshold (있으면)
+        effective_rsi, calibration_label = self._effective_rsi_threshold(ticker)
+
+        if not pd.isna(rsi) and rsi < effective_rsi:
+            condition_reasons.append(f"RSI={rsi:.1f} < {effective_rsi}")
 
         if not pd.isna(bb_lower) and price < bb_lower:
-            reasons.append(f"가격 ${price:.2f} < BB하단 ${bb_lower:.2f}")
+            condition_reasons.append(f"가격 ${price:.2f} < BB하단 ${bb_lower:.2f}")
 
-        if len(reasons) >= 2:
+        if len(condition_reasons) >= 2:
             strength = SignalStrength.STRONG
-        elif len(reasons) == 1:
+        elif len(condition_reasons) == 1:
             strength = SignalStrength.WEAK
         else:
             strength = SignalStrength.NONE
+
+        # 컨텍스트 라인은 condition 뒤에 부착 (강도 판정에 영향 없음)
+        reasons: list[str] = list(condition_reasons)
+        if calibration_label and strength != SignalStrength.NONE:
+            reasons.append(calibration_label)
 
         # M1: 이벤트 캘린더 컨텍스트 주입 (graceful, 실패해도 시그널은 정상 발동)
         if self.calendar_fetcher is not None:

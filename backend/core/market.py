@@ -54,6 +54,7 @@ class MarketSnapshot:
     crypto_mcap_billion_usd: Optional[float] = None
     commodities: list[Quote] = field(default_factory=list)
     sentiment: list[FearGreed] = field(default_factory=list)
+    correlations: list = field(default_factory=list)        # M2-C: list[CorrelationPair]
     errors: list[str] = field(default_factory=list)
 
 
@@ -170,14 +171,24 @@ def _fetch_coingecko_global() -> tuple[Optional[float], Optional[float]]:
 # 메인
 # ──────────────────────────────────────────────
 
+def _safe_compute_correlations() -> list:
+    """correlations 모듈 실패해도 market snapshot은 살아남도록 격리."""
+    try:
+        from .correlations import compute_all_pairs
+        return compute_all_pairs()
+    except Exception as e:
+        log.warning(f"[Market] correlations 계산 실패 (무시): {type(e).__name__}: {e}")
+        return []
+
+
 class MarketFetcher:
     """모든 소스를 병렬 fetch. 실패는 부분적으로 허용 — 가능한 만큼만 채워서 반환."""
 
     def fetch(self) -> MarketSnapshot:
         snap = MarketSnapshot(fetched_at=datetime.now(timezone.utc))
 
-        # 4개 그룹을 병렬로 (각 그룹은 자체적으로 또 병렬)
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="market-group") as ex:
+        # 5개 그룹을 병렬로 (각 그룹은 자체적으로 또 병렬)
+        with ThreadPoolExecutor(max_workers=5, thread_name_prefix="market-group") as ex:
             f_indices = ex.submit(_fetch_quotes_parallel, INDICES)
             f_bonds = ex.submit(_fetch_quotes_parallel, BONDS)
             f_crypto = ex.submit(_fetch_quotes_parallel, CRYPTO)
@@ -185,6 +196,8 @@ class MarketFetcher:
             f_cnn = ex.submit(_fetch_cnn_fg)
             f_cfg = ex.submit(_fetch_crypto_fg)
             f_cg = ex.submit(_fetch_coingecko_global)
+            # M2-C: dual-window 상관계수 (별도 모듈, 실패해도 본 fetch는 살림)
+            f_corr = ex.submit(_safe_compute_correlations)
 
             snap.indices = f_indices.result()
             snap.bonds = f_bonds.result()
@@ -193,6 +206,7 @@ class MarketFetcher:
             cnn = f_cnn.result()
             cfg = f_cfg.result()
             dom, mcap_b = f_cg.result()
+            snap.correlations = f_corr.result()
 
         if cnn:
             snap.sentiment.append(cnn)
@@ -308,6 +322,19 @@ def format_telegram(snap: MarketSnapshot) -> str:
             if q.error: continue
             unit = " /oz" if q.label == "금" else (" /bbl" if "WTI" in q.label else "")
             lines.append(f"  {q.label:10s} ${_fmt_price(q.label, q.price):>10s}{unit}  {_fmt_pct(q.change_pct)}")
+
+    # 상관관계 (M2-C, dual-window)
+    if snap.correlations:
+        valid = [c for c in snap.correlations if c.corr_short is not None and c.corr_long is not None]
+        if valid:
+            lines.append("\n🔗 <b>상관관계</b>  <i>(현재 20d / 기준 200d)</i>")
+            for c in valid:
+                delta_arrow = "↑" if (c.delta or 0) > 0 else ("↓" if (c.delta or 0) < 0 else "·")
+                lines.append(
+                    f"  {c.label_a}–{c.label_b}: "
+                    f"{c.corr_short:+.2f} / {c.corr_long:+.2f}  "
+                    f"{delta_arrow} {c.interpretation}"
+                )
 
     if snap.errors:
         lines.append(f"\n⚠️ 일부 데이터 누락 ({len(snap.errors)}건)")
