@@ -119,34 +119,36 @@ def _persist_llm_call(usage) -> None:
 
 def cmd_help(args: list[str], ctx: BotContext) -> str:
     return (
-        "<b>bullsfact 봇 명령어</b>\n"
+        "<b>🤖 bullsfact 명령어</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
-        "<b>/list</b> (또는 /ls)\n"
-        "  워치리스트 + 현재 RSI/신호\n\n"
-        "<b>/market</b>\n"
-        "  시장 현황 (지수/채권/심리/크립토/원자재)\n"
-        "  매일 06:00 KST 자동 발송\n\n"
-        "<b>/add TICKER</b>\n"
-        "  종목 추가 (예: /add NVDA, /add ETH/USDT)\n\n"
-        "<b>/remove TICKER</b> (또는 /rm)\n"
-        "  종목 삭제\n\n"
-        "<b>/cost</b>\n"
-        "  오늘/어제 LLM 비용 + 알람 카운트\n\n"
-        "<b>/alert</b>\n"
-        "  가격/VIX/F&G 임계치 알림 관리 (서브명령 안내)\n\n"
-        "<b>/position</b> (또는 /pos)\n"
-        "  보유 포지션 + 익절 룰 추적 (서브명령 안내)\n\n"
-        "<b>/exposure</b> (또는 /expo)\n"
-        "  포트폴리오 SPY/SOXX 베타 + R² (집중도 진단)\n\n"
-        "<b>/why [TICKER]</b>\n"
-        "  왜 움직이는가 — LLM + 웹검색 해설\n"
-        "  인자 없으면 현재 매크로 상황 (~$0.05/회)\n\n"
-        "<b>/test [TICKER]</b>\n"
-        "  가짜 STRONG 알람 (raw, LLM 비용 0)\n\n"
-        "<b>/help</b>\n"
-        "  이 메시지\n\n"
-        "<i>💡 /position add 와 /alert add 는 멀티라인 일괄 입력 지원\n"
-        "(첫 줄에 명령, 다음 줄마다 인자)</i>\n"
+        "\n"
+        "<b>📊 시장 정보</b>\n"
+        "  /market — 시장 스냅샷 (지수/VIX/F&amp;G/상관)\n"
+        "    매일 06:00 KST 자동 발송\n"
+        "  /list — 워치리스트 + RSI + 임박 이벤트\n"
+        "  /why [TICKER] — LLM 매크로/티커 해설\n"
+        "    예: /why SOXL, /why (인자 없으면 매크로)\n"
+        "\n"
+        "<b>💼 포트폴리오</b>\n"
+        "  /portfolio — 통합 (서브명령 안내)\n"
+        "    list / exposure / add / update / remove\n"
+        "    예: /portfolio add SOXL 23 21.47\n"
+        "    여러 라인 일괄 입력 OK\n"
+        "\n"
+        "<b>📋 워치리스트</b>\n"
+        "  /add TICKER — 추가 (예: /add NVDA, /add ETH/USDT)\n"
+        "  /remove TICKER — 삭제\n"
+        "\n"
+        "<b>🔔 알림</b>\n"
+        "  /alert — 가격/VIX/F&amp;G 임계치 (서브명령)\n"
+        "    add / list / remove / pause / resume\n"
+        "    여러 라인 일괄 입력 OK\n"
+        "\n"
+        "<b>⚙️ 시스템</b>\n"
+        "  /cost — LLM 비용 + 알람 카운트\n"
+        "  /test [TICKER] — 헬스체크 (가짜 알림)\n"
+        "\n"
+        "<i>구버전 alias: /position, /pos, /exposure, /expo 도 동작</i>"
     )
 
 
@@ -653,23 +655,26 @@ def cmd_alert(args: list[str], ctx: BotContext) -> str:
 # /position — 보유 포지션 + 익절 룰 추적
 # ──────────────────────────────────────────────
 
-_POSITION_HELP = (
-    "<b>보유 포지션 + 익절 룰</b>\n"
+_PORTFOLIO_HELP = (
+    "<b>📊 포트폴리오 — 보유 + 익절 룰 + 노출도</b>\n"
     "━━━━━━━━━━━━━━━━━\n"
-    "<b>/position list</b>  현재 P&amp;L + 다음 마일스톤\n"
-    "<b>/position add TICKER QTY AVG_COST [메모]</b>\n"
-    "  예: <code>/position add SOXL 23 21.47</code>\n"
-    "  → 신규 추가. 이미 지나간 마일스톤은 자동 스킵 (알림 폭탄 방지)\n\n"
-    "<b>/position update TICKER QTY AVG_COST</b>\n"
-    "  수량/평단 갱신. <i>마일스톤은 0으로 초기화</i>\n\n"
-    "<b>/position remove TICKER</b>\n\n"
+    "<b>/portfolio list</b>  현재 P&amp;L + 다음 마일스톤\n"
+    "<b>/portfolio exposure</b>  SPY/SOXX 베타 + R² (집중도)\n"
+    "<b>/portfolio add TICKER QTY AVG_COST [메모]</b>\n"
+    "  예: <code>/portfolio add SOXL 23 21.47</code>\n"
+    "  여러 라인 일괄 입력 가능. 같은 종목 다른 값이면 거부됨\n\n"
+    "<b>/portfolio update TICKER QTY AVG_COST</b>\n"
+    "  명시적 갱신 (덮어쓰기 허용)\n\n"
+    "<b>/portfolio remove TICKER</b>\n\n"
     "<b>익절 룰 (참고):</b>\n"
     "  +50% → 20% 매도 (누적 20%)\n"
     "  +100% → 30% 매도 (누적 50%, 원금 회수)\n"
     "  +200% → 25% 매도 (누적 75%)\n"
     "  +400% → 15% 매도 (누적 90%)\n"
-    "  +600% → 재량 매도 (공짜 칩)\n"
+    "  +600% → 재량 매도 (공짜 칩)\n\n"
+    "<i>구버전 alias: /position, /exposure 도 동작합니다</i>"
 )
+_POSITION_HELP = _PORTFOLIO_HELP   # backcompat
 
 
 def _next_milestone_label(highest: float, current_pct: float) -> str:
@@ -855,13 +860,24 @@ def _cmd_position_remove(args: list[str]) -> str:
     return f"🗑️ 포지션 삭제: <b>{_esc(ticker)}</b>" if ok else f"❌ 없음: <b>{_esc(ticker)}</b>"
 
 
-def cmd_position(args: list[str], ctx: BotContext) -> str:
+def cmd_portfolio(args: list[str], ctx: BotContext) -> str:
+    """
+    통합 포트폴리오 명령. /position 과 /exposure 의 슈퍼셋.
+    하위:
+      list     보유 + P&L + 다음 마일스톤
+      exposure 베타 + R² (M2-B)
+      add      포지션 추가
+      update   강제 갱신
+      remove   삭제
+    """
     if not args:
-        return _POSITION_HELP
+        return _PORTFOLIO_HELP
     sub = args[0].lower()
     rest = args[1:]
-    if sub == "list" or sub == "ls":
+    if sub in ("list", "ls"):
         return _cmd_position_list(ctx)
+    if sub in ("exposure", "expo"):
+        return _cmd_exposure_inner(ctx)
     if sub == "add":
         return _cmd_position_add(rest, ctx)
     if sub == "update":
@@ -869,8 +885,13 @@ def cmd_position(args: list[str], ctx: BotContext) -> str:
     if sub in ("remove", "rm", "delete"):
         return _cmd_position_remove(rest)
     if sub in ("help", "?"):
-        return _POSITION_HELP
-    return f"알 수 없는 하위 명령: <code>{_esc(sub)}</code>\n\n" + _POSITION_HELP
+        return _PORTFOLIO_HELP
+    return f"알 수 없는 하위 명령: <code>{_esc(sub)}</code>\n\n" + _PORTFOLIO_HELP
+
+
+# Backcompat — 기존 /position muscle memory 보존
+def cmd_position(args: list[str], ctx: BotContext) -> str:
+    return cmd_portfolio(args, ctx)
 
 
 # ──────────────────────────────────────────────
@@ -935,7 +956,8 @@ def _format_exposure(expo: PortfolioExposure) -> str:
     return "\n".join(lines)
 
 
-def cmd_exposure(args: list[str], ctx: BotContext) -> str:
+def _cmd_exposure_inner(ctx: BotContext) -> str:
+    """exposure 본문 — /portfolio exposure 와 /exposure (backcompat) 둘 다에서 호출."""
     db = SessionLocal()
     try:
         positions = crud.list_positions(db)
@@ -943,7 +965,7 @@ def cmd_exposure(args: list[str], ctx: BotContext) -> str:
         db.close()
     if not positions:
         return ("등록된 포지션 없음.\n"
-                "<code>/position add SOXL 23 21.47</code> 로 추가 후 재호출.")
+                "<code>/portfolio add SOXL 23 21.47</code> 로 추가 후 재호출.")
 
     try:
         expo = compute_exposure(ctx.provider, positions)
@@ -955,6 +977,11 @@ def cmd_exposure(args: list[str], ctx: BotContext) -> str:
         return "⚠️ 노출도 계산 실패 — 데이터 부족 또는 벤치마크 fetch 실패"
 
     return _format_exposure(expo)
+
+
+# Backcompat — 기존 /exposure muscle memory 보존
+def cmd_exposure(args: list[str], ctx: BotContext) -> str:
+    return _cmd_exposure_inner(ctx)
 
 
 # ──────────────────────────────────────────────
@@ -1038,37 +1065,45 @@ def cmd_test(args: list[str], ctx: BotContext) -> str:
 
 
 COMMANDS: dict[str, Callable[[list[str], BotContext], str]] = {
-    "help":   cmd_help,
-    "start":  cmd_help,
+    # 시장 정보
+    "market": cmd_market,
     "list":   cmd_list,
-    "ls":     cmd_list,
+    "ls":     cmd_list,            # alias
+    "why":    cmd_why,
+
+    # 워치리스트
     "add":    cmd_add,
     "remove": cmd_remove,
-    "rm":     cmd_remove,
-    "cost":   cmd_cost,
-    "market": cmd_market,
+    "rm":     cmd_remove,          # alias
+
+    # 포트폴리오 (통합)
+    "portfolio": cmd_portfolio,
+    "port":      cmd_portfolio,    # alias
+    "position":  cmd_position,     # backcompat alias
+    "pos":       cmd_position,     # backcompat alias
+    "exposure":  cmd_exposure,     # backcompat alias
+    "expo":      cmd_exposure,     # backcompat alias
+
+    # 알림
     "alert":  cmd_alert,
-    "position": cmd_position,
-    "pos":      cmd_position,
-    "exposure": cmd_exposure,
-    "expo":     cmd_exposure,
-    "why":    cmd_why,
+
+    # 시스템 (자동완성 메뉴 숨김)
+    "cost":   cmd_cost,
     "test":   cmd_test,
+    "help":   cmd_help,
+    "start":  cmd_help,            # alias
 }
 
-# Telegram 자동완성 메뉴에 노출할 명령어 (alias는 제외 — 깔끔하게)
+# Telegram 자동완성 메뉴 — 핵심 8개만. 시스템성/alias 는 제외.
 COMMAND_DESCRIPTIONS: list[tuple[str, str]] = [
-    ("list",   "워치리스트 + 현재 RSI/신호"),
-    ("market", "시장 현황 (지수/채권/심리/크립토)"),
-    ("add",    "종목 추가 (예: /add NVDA)"),
-    ("remove", "종목 삭제"),
-    ("cost",   "LLM 비용 + 알람 카운트"),
-    ("alert",  "가격/VIX/F&G 임계치 알림 (/alert 로 사용법)"),
-    ("position", "보유 포지션 + 익절 룰 (/position 로 사용법)"),
-    ("exposure", "포트폴리오 베타 + R² (SPY/SOXX 동조도)"),
-    ("why",    "왜 움직이는가 — /why TICKER 또는 /why (매크로)"),
-    ("test",   "가짜 STRONG 알람 (헬스체크)"),
-    ("help",   "명령어 목록"),
+    ("market",    "🌐 시장 스냅샷 (지수/VIX/F&G/상관)"),
+    ("list",      "📋 워치리스트 + RSI + 임박 이벤트"),
+    ("why",       "🔍 왜 움직이는가 — /why TICKER 또는 /why"),
+    ("portfolio", "💼 보유 + 익절 룰 + 노출도"),
+    ("alert",     "🔔 가격/VIX/F&G 임계치 (서브명령)"),
+    ("add",       "➕ 워치리스트 추가"),
+    ("remove",    "➖ 워치리스트 제거"),
+    ("help",      "❓ 명령어 안내"),
 ]
 
 
