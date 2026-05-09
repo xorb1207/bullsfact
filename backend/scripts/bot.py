@@ -45,6 +45,7 @@ from backend.core.money import format_money, format_money_signed, currency_for
 from backend.core.datasource.calendar_fetcher import CalendarFetcher
 from backend.core.exposure import compute_exposure, PortfolioExposure
 from backend.core.reminders import get_due_reminders, format_section as format_reminders
+from backend.core.post_mortem import update_returns, compute_statistics, format_stats_section
 
 log = logging.getLogger("bot")
 logging.basicConfig(
@@ -388,17 +389,26 @@ def cmd_cost(args: list[str], ctx: BotContext) -> str:
         alerts = _alert_summary_today(db)
         cap = float(os.getenv("MAX_DAILY_LLM_USD", "2.0"))
         today_pct = today["cost_usd"] / cap * 100 if cap else 0
-        return (
+        body = (
             "<b>💰 bullsfact 비용 리포트</b>\n"
             "━━━━━━━━━━━━━━━━━\n"
             f"<b>오늘</b>: ${today['cost_usd']:.4f} / 캡 ${cap:.2f} ({today_pct:.1f}%)\n"
             f"  LLM {today['calls']}회, "
             f"알람 STRONG {alerts['strong']} / WEAK {alerts['weak']}\n\n"
             f"<b>어제</b>: ${yest['cost_usd']:.4f} ({yest['calls']}회)\n"
-            f"<b>최근 7일</b>: ${wk['cost_usd']:.4f} ({wk['calls']}회)\n"
+            f"<b>최근 7일</b>: ${wk['cost_usd']:.4f} ({wk['calls']}회)"
         )
     finally:
         db.close()
+
+    # M3 부가: 자기 검증 통계 (누적 데이터 있을 때만 노출)
+    try:
+        stats = compute_statistics(lookback_days=90)
+        body += format_stats_section(stats, lookback_days=90)
+    except Exception as e:
+        log.warning(f"[/cost] stats 계산 실패 (무시): {type(e).__name__}: {e}")
+
+    return body
 
 
 def _format_upcoming_events_section(ctx: BotContext, lookahead_days: int = 21) -> str:
@@ -436,6 +446,14 @@ def send_market_report(ctx: BotContext) -> None:
     """매일 자동 발송 (스케줄러 호출). 시장 스냅샷 + LLM 매크로 해설."""
     try:
         log.info("[scheduler] 매일 시장 리포트 발송")
+        # M3 부가: 알림 후속 추적 — 매일 1회 갱신 (브리핑 발송 전, 무관 실패 격리)
+        try:
+            n = update_returns()
+            if n:
+                log.info(f"[scheduler] 알림 후속 데이터 {n}건 갱신")
+        except Exception as e:
+            log.error(f"[scheduler] 후속 추적 실패 (무시): {type(e).__name__}: {e}")
+
         snap = ctx.market.fetch()
         text = "🌅 <b>모닝 브리핑</b>\n\n" + format_market(snap)
 

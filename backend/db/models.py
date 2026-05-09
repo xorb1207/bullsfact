@@ -31,6 +31,11 @@ class AlertLog(Base):
     source = Column(String(16), nullable=False)
     reasons = Column(JSON, nullable=True)
     sent_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    # M3 부가: 알림 후속 추적 (post-mortem) — 발동 후 D+7 / D+30 종가
+    price_7d = Column(Float, nullable=True)
+    price_30d = Column(Float, nullable=True)
+    return_7d = Column(Float, nullable=True)         # decimal (0.05 = +5%)
+    return_30d = Column(Float, nullable=True)
 
 
 class BacktestResult(Base):

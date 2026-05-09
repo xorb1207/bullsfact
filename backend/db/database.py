@@ -42,6 +42,14 @@ def _run_lightweight_migrations() -> None:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE watchlist ADD COLUMN name VARCHAR(128)"))
 
+    # alert_log post-mortem 컬럼 (M3 부가)
+    if "alert_log" in existing_tables:
+        cols = {c["name"] for c in inspector.get_columns("alert_log")}
+        with engine.begin() as conn:
+            for col_name in ("price_7d", "price_30d", "return_7d", "return_30d"):
+                if col_name not in cols:
+                    conn.execute(text(f"ALTER TABLE alert_log ADD COLUMN {col_name} FLOAT"))
+
 
 def get_db():
     """FastAPI Depends용 세션 제너레이터."""
