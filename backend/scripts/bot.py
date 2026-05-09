@@ -292,9 +292,24 @@ def _short_company_name(name: Optional[str], max_len: int = 26) -> str:
 
 
 def _fetch_ticker_name(ticker: str, source: str) -> Optional[str]:
-    """yfinance.info에서 회사명 가져오기. 실패는 조용히 None."""
+    """
+    회사명 가져오기. 실패는 조용히 None.
+    - 한국 종목 (.KS/.KQ): DART corpCode.xml 한글명 우선, 실패 시 yfinance 영문 fallback
+    - 그 외: yfinance.info.longName/shortName
+    """
     if source != "yfinance":
         return None
+    # 한국 종목은 한글명 우선
+    upper = ticker.upper()
+    if upper.endswith(".KS") or upper.endswith(".KQ"):
+        try:
+            from backend.core.datasource.krx_names import resolve_korean_name
+            kr = resolve_korean_name(ticker)
+            if kr:
+                return kr
+        except Exception as e:
+            log.debug(f"[name] KR resolve 실패 ({ticker}): {type(e).__name__}: {e}")
+        # fallthrough → 영문 fallback
     try:
         import yfinance as yf
         info = yf.Ticker(ticker).info

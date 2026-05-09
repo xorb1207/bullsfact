@@ -32,3 +32,6 @@ dist/
 
 # Logs
 *.log
+
+# 외부 데이터 캐시 (DART corpCode.xml 등)
+backend/data/
