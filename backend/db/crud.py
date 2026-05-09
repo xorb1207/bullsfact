@@ -7,7 +7,7 @@ from typing import Optional, Sequence
 from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 
-from .models import Watchlist, AlertLog, BacktestResult, LLMCallLog, ThresholdAlert, Position, EventCalibration
+from .models import Watchlist, AlertLog, BacktestResult, LLMCallLog, ThresholdAlert, Position, EventCalibration, SellReminder
 
 
 # ──────────────────────────────────────────────
@@ -363,6 +363,83 @@ def re_arm_due_alerts(db: Session) -> int:
     if count:
         db.commit()
     return count
+
+
+# ──────────────────────────────────────────────
+# SellReminder
+# ──────────────────────────────────────────────
+
+def list_reminders(
+    db: Session, *, active_only: bool = True,
+) -> Sequence[SellReminder]:
+    stmt = select(SellReminder)
+    if active_only:
+        stmt = stmt.where(SellReminder.active.is_(True))
+    stmt = stmt.order_by(SellReminder.target_date.asc())
+    return db.execute(stmt).scalars().all()
+
+
+def get_reminder(db: Session, rid: int) -> Optional[SellReminder]:
+    return db.get(SellReminder, rid)
+
+
+def insert_reminder(
+    db: Session,
+    *,
+    title: str,
+    target_date: datetime,
+    notes: Optional[str] = None,
+    days_before: int = 7,
+) -> SellReminder:
+    row = SellReminder(
+        title=title,
+        target_date=target_date,
+        notes=notes,
+        days_before=days_before,
+        active=True,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def mark_reminder_done(db: Session, rid: int) -> bool:
+    row = db.get(SellReminder, rid)
+    if not row:
+        return False
+    row.active = False
+    row.done_at = datetime.utcnow()
+    db.commit()
+    return True
+
+
+def delete_reminder(db: Session, rid: int) -> bool:
+    row = db.get(SellReminder, rid)
+    if not row:
+        return False
+    db.delete(row)
+    db.commit()
+    return True
+
+
+def auto_expire_past_reminders(db: Session) -> int:
+    """D+1 지난 미완료 리마인더 자동 비활성. 반환: 처리 개수."""
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=1)
+    rows = db.execute(
+        select(SellReminder).where(
+            SellReminder.active.is_(True),
+            SellReminder.target_date < cutoff,
+        )
+    ).scalars().all()
+    n = 0
+    for r in rows:
+        r.active = False
+        n += 1
+    if n:
+        db.commit()
+    return n
 
 
 # ──────────────────────────────────────────────

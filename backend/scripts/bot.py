@@ -44,6 +44,7 @@ from backend.core.positions import MILESTONES, highest_passed_milestone
 from backend.core.money import format_money, format_money_signed, currency_for
 from backend.core.datasource.calendar_fetcher import CalendarFetcher
 from backend.core.exposure import compute_exposure, PortfolioExposure
+from backend.core.reminders import get_due_reminders, format_section as format_reminders
 
 log = logging.getLogger("bot")
 logging.basicConfig(
@@ -143,6 +144,11 @@ def cmd_help(args: list[str], ctx: BotContext) -> str:
         "  /alert — 가격/VIX/F&amp;G 임계치 (서브명령)\n"
         "    add / list / remove / pause / resume\n"
         "    여러 라인 일괄 입력 OK\n"
+        "\n"
+        "<b>📅 매도 캘린더</b>\n"
+        "  /reminder — 양도세 분할 매도 일정 (서브명령)\n"
+        "    add / list / done / remove\n"
+        "    D-7부터 매일 06:00 KST 브리핑에 자동 첨부\n"
         "\n"
         "<b>⚙️ 시스템</b>\n"
         "  /cost — LLM 비용 + 알람 카운트\n"
@@ -429,6 +435,15 @@ def send_market_report(ctx: BotContext) -> None:
                     log.warning("[scheduler] 매크로 해설 생성 실패 — 스킵")
             except Exception as e:
                 log.error(f"[scheduler] 매크로 해설 예외 (무시): {type(e).__name__}: {e}")
+
+        # 매도 캘린더 임박 항목 (양도세 분할 매도 등) — 실패해도 본 브리핑은 발송
+        try:
+            due = get_due_reminders()
+            if due:
+                text += "\n" + format_reminders(due)
+                log.info(f"[scheduler] 매도 리마인더 {len(due)}건 첨부")
+        except Exception as e:
+            log.error(f"[scheduler] 리마인더 예외 (무시): {type(e).__name__}: {e}")
 
         send(ctx, text)
     except Exception as e:
@@ -1029,6 +1044,139 @@ def cmd_why(args: list[str], ctx: BotContext) -> str:
     return format_research(result)
 
 
+# ──────────────────────────────────────────────
+# /reminder — 매도 캘린더 (양도세 분할 매도 등)
+# ──────────────────────────────────────────────
+
+_REMINDER_HELP = (
+    "<b>📅 매도 캘린더 리마인더</b>\n"
+    "━━━━━━━━━━━━━━━━━\n"
+    "<b>/reminder list</b>  활성 리마인더 목록\n"
+    "<b>/reminder list all</b>  완료/만료 포함\n\n"
+    "<b>/reminder add YYYY-MM-DD 제목 [메모...]</b>\n"
+    "  예: <code>/reminder add 2026-06-15 1차 매도 (TQQQ 15+SOXL 5)</code>\n"
+    "  D-7 부터 매일 06:00 KST 브리핑에 첨부\n\n"
+    "<b>/reminder done ID</b>  완료 처리 (알림 종료)\n"
+    "<b>/reminder remove ID</b>  영구 삭제\n\n"
+    "<i>매매전략 §1.2 양도세 250만원 공제 분할 매도 일정 관리용</i>"
+)
+
+
+def _parse_date(s: str):
+    from datetime import datetime as _dt
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            return _dt.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _cmd_reminder_list(args: list[str]) -> str:
+    show_all = bool(args and args[0].lower() == "all")
+    db = SessionLocal()
+    try:
+        rows = crud.list_reminders(db, active_only=not show_all)
+    finally:
+        db.close()
+    if not rows:
+        return "등록된 리마인더 없음. <code>/reminder</code> 로 사용법 확인."
+    from datetime import datetime as _dt
+    today = _dt.utcnow().date()
+    header = "<b>매도 캘린더</b>" + (" (전체)" if show_all else " (활성)")
+    lines = [header, "━━━━━━━━━━━━━━━━━"]
+    for r in rows:
+        target = r.target_date.date() if hasattr(r.target_date, "date") else r.target_date
+        delta = (target - today).days
+        if not r.active:
+            status = "✅ 완료" if r.done_at else "⚪ 만료"
+            tag = f"{status} ({target})"
+        elif delta < 0:
+            tag = f"⚠️ 지남 D+{-delta} ({target})"
+        elif delta == 0:
+            tag = f"🔴 오늘 ({target})"
+        elif delta <= r.days_before:
+            tag = f"🟡 D-{delta} ({target})"
+        else:
+            tag = f"D-{delta} ({target})"
+        notes_str = f"\n   📝 {_esc(r.notes)}" if r.notes else ""
+        lines.append(f"<b>#{r.id}</b> {_esc(r.title)} — {tag}{notes_str}")
+    return "\n".join(lines)
+
+
+def _cmd_reminder_add(args: list[str]) -> str:
+    if len(args) < 2:
+        return "사용법: <code>/reminder add 2026-06-15 1차 매도 (TQQQ 15+SOXL 5)</code>"
+    target = _parse_date(args[0])
+    if target is None:
+        return f"날짜 형식 인식 실패: <code>{_esc(args[0])}</code> (YYYY-MM-DD 권장)"
+    title_parts = args[1:]
+    title = " ".join(title_parts).strip()
+    if not title:
+        return "제목 필수"
+    # title 너무 길면 일부를 notes 로 분리
+    if len(title) > 80 and "—" in title:
+        parts = title.split("—", 1)
+        title = parts[0].strip()[:80]
+        notes = parts[1].strip()
+    else:
+        notes = None
+    db = SessionLocal()
+    try:
+        row = crud.insert_reminder(db, title=title, target_date=target, notes=notes)
+    finally:
+        db.close()
+    return f"✅ 리마인더 #{row.id} 등록: <b>{_esc(title)}</b> ({target.strftime('%Y-%m-%d')})"
+
+
+def _cmd_reminder_done(args: list[str]) -> str:
+    if not args:
+        return "사용법: <code>/reminder done 42</code>"
+    try:
+        rid = int(args[0])
+    except ValueError:
+        return f"ID 파싱 실패: <code>{_esc(args[0])}</code>"
+    db = SessionLocal()
+    try:
+        ok = crud.mark_reminder_done(db, rid)
+    finally:
+        db.close()
+    return f"✅ 리마인더 #{rid} 완료 처리" if ok else f"❌ 없음: #{rid}"
+
+
+def _cmd_reminder_remove(args: list[str]) -> str:
+    if not args:
+        return "사용법: <code>/reminder remove 42</code>"
+    try:
+        rid = int(args[0])
+    except ValueError:
+        return f"ID 파싱 실패: <code>{_esc(args[0])}</code>"
+    db = SessionLocal()
+    try:
+        ok = crud.delete_reminder(db, rid)
+    finally:
+        db.close()
+    return f"🗑️ 리마인더 #{rid} 삭제됨" if ok else f"❌ 없음: #{rid}"
+
+
+def cmd_reminder(args: list[str], ctx: BotContext) -> str:
+    if not args:
+        return _REMINDER_HELP
+    sub = args[0].lower()
+    rest = args[1:]
+    if sub == "list":
+        return _cmd_reminder_list(rest)
+    if sub == "add":
+        return _cmd_reminder_add(rest)
+    if sub == "done":
+        return _cmd_reminder_done(rest)
+    if sub in ("remove", "rm", "delete"):
+        return _cmd_reminder_remove(rest)
+    if sub in ("help", "?"):
+        return _REMINDER_HELP
+    return f"알 수 없는 하위 명령: <code>{_esc(sub)}</code>\n\n" + _REMINDER_HELP
+
+
 def cmd_test(args: list[str], ctx: BotContext) -> str:
     """가짜 STRONG 시그널을 raw 모드로 발사 (LLM 비용 0)."""
     ticker = args[0].upper() if args else "ETH/USDT"
@@ -1087,6 +1235,10 @@ COMMANDS: dict[str, Callable[[list[str], BotContext], str]] = {
     # 알림
     "alert":  cmd_alert,
 
+    # 매도 캘린더
+    "reminder": cmd_reminder,
+    "remind":   cmd_reminder,    # alias
+
     # 시스템 (자동완성 메뉴 숨김)
     "cost":   cmd_cost,
     "test":   cmd_test,
@@ -1101,6 +1253,7 @@ COMMAND_DESCRIPTIONS: list[tuple[str, str]] = [
     ("why",       "🔍 왜 움직이는가 — /why TICKER 또는 /why"),
     ("portfolio", "💼 보유 + 익절 룰 + 노출도"),
     ("alert",     "🔔 가격/VIX/F&G 임계치 (서브명령)"),
+    ("reminder",  "📅 매도 캘린더 (양도세 분할 매도)"),
     ("add",       "➕ 워치리스트 추가"),
     ("remove",    "➖ 워치리스트 제거"),
     ("help",      "❓ 명령어 안내"),

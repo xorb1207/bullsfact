@@ -112,6 +112,25 @@ class ThresholdAlert(Base):
 Index("ix_threshold_alert_active_metric", ThresholdAlert.active, ThresholdAlert.metric_type)
 
 
+class SellReminder(Base):
+    """
+    매도 캘린더 리마인더 (양도세 250만원 분할 매도 등 일정 알림).
+
+    매매전략 §1.2 — 한국 해외주식 양도세 22%, 250만원/년 공제 활용.
+    target_date 까지 D-N 매일 일일 브리핑에 첨부. 완료는 /reminder done.
+    """
+    __tablename__ = "sell_reminder"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(128), nullable=False)        # "1차 매도 — TQQQ 15 + SOXL 5"
+    target_date = Column(DateTime, nullable=False, index=True)
+    notes = Column(String(512), nullable=True)         # "차익 ~$1,390 (공제 내)"
+    days_before = Column(Integer, nullable=False, default=7)   # D-N 부터 알림
+    active = Column(Boolean, nullable=False, default=True, index=True)
+    done_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 class EventCalibration(Base):
     """
     이벤트별 RSI 임계치 캘리브레이션 결과 (M2-A).
