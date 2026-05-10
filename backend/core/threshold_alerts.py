@@ -141,15 +141,16 @@ class ThresholdAlertEvaluator:
         ticker: str,
         df: pd.DataFrame,
         current_price: float,
+        user_id: Optional[int] = None,
     ) -> list[AlertEvaluation]:
-        """이 ticker에 걸린 모든 활성 'price' 알림을 평가."""
+        """이 ticker에 걸린 (특정 사용자의) 활성 'price' 알림을 평가."""
         results: list[AlertEvaluation] = []
-        # 동일 ticker는 사이클당 같은 컨텍스트 — 한 번만 가져옴
         cal_ctx = self._calendar_contexts(ticker)
         db = SessionLocal()
         try:
             alerts = crud.list_threshold_alerts(
-                db, active_only=True, metric_type=METRIC_PRICE, ticker=ticker
+                db, active_only=True, metric_type=METRIC_PRICE, ticker=ticker,
+                user_id=user_id,
             )
             for a in alerts:
                 threshold = resolve_threshold(a, df)
@@ -172,10 +173,11 @@ class ThresholdAlertEvaluator:
             db.close()
         return results
 
-    def evaluate_market_gauges(self, snap: MarketSnapshot) -> list[AlertEvaluation]:
-        """MarketSnapshot에서 VIX/F&G 값을 뽑아 활성 알림과 비교."""
+    def evaluate_market_gauges(
+        self, snap: MarketSnapshot, user_id: Optional[int] = None,
+    ) -> list[AlertEvaluation]:
+        """MarketSnapshot에서 VIX/F&G 값을 뽑아 (사용자별) 활성 알림과 비교."""
         results: list[AlertEvaluation] = []
-        # 게이지는 종목 무관 — 매크로 컨텍스트만 한 번 가져와서 공유
         cal_ctx = self._calendar_contexts(None)
 
         # 메트릭별 현재값 추출
@@ -200,7 +202,7 @@ class ThresholdAlertEvaluator:
                 if current is None:
                     continue
                 alerts = crud.list_threshold_alerts(
-                    db, active_only=True, metric_type=metric_type
+                    db, active_only=True, metric_type=metric_type, user_id=user_id,
                 )
                 for a in alerts:
                     # 게이지 메트릭은 항상 abs_value 사용 (df가 없으니)

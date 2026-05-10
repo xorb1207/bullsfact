@@ -33,22 +33,20 @@ class DueReminder:
     notes: Optional[str]
 
 
-def get_due_reminders() -> list[DueReminder]:
+def get_due_reminders(user_id: Optional[int] = None) -> list[DueReminder]:
     """
-    현재 활성 + 임박 (target_date - days_before <= today <= target_date) 리마인더 반환.
-    가까운 순(days_until 오름차순)으로 정렬.
+    현재 활성 + 임박 리마인더 반환. user_id 지정 시 그 사용자 것만.
     """
     today = datetime.utcnow().date()
     out: list[DueReminder] = []
     db = SessionLocal()
     try:
-        # 자동 expire 먼저 (D+1 지난 항목 정리)
         try:
             crud.auto_expire_past_reminders(db)
         except Exception as e:
             log.warning(f"[Reminders] auto_expire 실패: {e}")
 
-        rows = crud.list_reminders(db, active_only=True)
+        rows = crud.list_reminders(db, active_only=True, user_id=user_id)
         for r in rows:
             target = r.target_date.date() if hasattr(r.target_date, "date") else r.target_date
             window_start = target - timedelta(days=r.days_before)

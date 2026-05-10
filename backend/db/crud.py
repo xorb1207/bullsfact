@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from .models import (
     Watchlist, AlertLog, BacktestResult, LLMCallLog, ThresholdAlert,
-    Position, EventCalibration, SellReminder, LLMCache, User,
+    Position, EventCalibration, SellReminder, LLMCache, User, Feedback,
 )
 
 
@@ -17,22 +17,52 @@ from .models import (
 # Watchlist
 # ──────────────────────────────────────────────
 
-def list_watchlist(db: Session, active_only: bool = True) -> Sequence[Watchlist]:
+def list_watchlist(
+    db: Session,
+    active_only: bool = True,
+    user_id: Optional[int] = None,
+) -> Sequence[Watchlist]:
     stmt = select(Watchlist)
     if active_only:
         stmt = stmt.where(Watchlist.active.is_(True))
+    if user_id is not None:
+        stmt = stmt.where(Watchlist.user_id == user_id)
     stmt = stmt.order_by(Watchlist.added_at.asc())
     return db.execute(stmt).scalars().all()
 
 
-def get_watchlist_item(db: Session, ticker: str) -> Optional[Watchlist]:
+def list_active_tickers_global(db: Session) -> Sequence[str]:
+    """Scanner 가 fetch 할 unique ticker 목록 (모든 사용자 합집합)."""
+    rows = db.execute(
+        select(Watchlist.ticker).where(Watchlist.active.is_(True)).distinct()
+    ).scalars().all()
+    return list(rows)
+
+
+def get_watchlist_item(
+    db: Session, ticker: str, user_id: Optional[int] = None,
+) -> Optional[Watchlist]:
+    stmt = select(Watchlist).where(Watchlist.ticker == ticker)
+    if user_id is not None:
+        stmt = stmt.where(Watchlist.user_id == user_id)
+    return db.execute(stmt).scalar_one_or_none()
+
+
+def get_any_watchlist_item(db: Session, ticker: str) -> Optional[Watchlist]:
+    """user_id 무관 — 회사명 캐시 lookup 등 메타 조회용."""
     return db.execute(
-        select(Watchlist).where(Watchlist.ticker == ticker)
+        select(Watchlist).where(Watchlist.ticker == ticker).limit(1)
     ).scalar_one_or_none()
 
 
-def add_watchlist(db: Session, ticker: str, source: str, name: Optional[str] = None) -> Watchlist:
-    existing = get_watchlist_item(db, ticker)
+def add_watchlist(
+    db: Session,
+    ticker: str,
+    source: str,
+    name: Optional[str] = None,
+    user_id: Optional[int] = None,
+) -> Watchlist:
+    existing = get_watchlist_item(db, ticker, user_id=user_id)
     if existing:
         existing.active = True
         existing.source = source
@@ -41,7 +71,9 @@ def add_watchlist(db: Session, ticker: str, source: str, name: Optional[str] = N
         db.commit()
         db.refresh(existing)
         return existing
-    item = Watchlist(ticker=ticker, source=source, name=name, active=True)
+    item = Watchlist(
+        ticker=ticker, source=source, name=name, active=True, user_id=user_id,
+    )
     db.add(item)
     db.commit()
     db.refresh(item)
@@ -49,17 +81,23 @@ def add_watchlist(db: Session, ticker: str, source: str, name: Optional[str] = N
 
 
 def update_watchlist_name(db: Session, ticker: str, name: str) -> bool:
-    item = get_watchlist_item(db, ticker)
-    if not item:
+    """전 사용자 공통 — 회사명은 시스템 메타. user_id 무관."""
+    rows = db.execute(
+        select(Watchlist).where(Watchlist.ticker == ticker)
+    ).scalars().all()
+    if not rows:
         return False
-    item.name = name
+    for r in rows:
+        r.name = name
     db.commit()
     return True
 
 
-def remove_watchlist(db: Session, ticker: str) -> bool:
-    """soft delete — active=False. 완전 삭제가 아니어서 알람 로그와의 의미적 일관성 유지."""
-    item = get_watchlist_item(db, ticker)
+def remove_watchlist(
+    db: Session, ticker: str, user_id: Optional[int] = None,
+) -> bool:
+    """soft delete — active=False. user_id 지정 시 그 사용자의 행만."""
+    item = get_watchlist_item(db, ticker, user_id=user_id)
     if not item:
         return False
     item.active = False
@@ -81,6 +119,7 @@ def insert_alert(
     bb_lower: Optional[float],
     source: str,
     reasons: Optional[list[str]] = None,
+    user_id: Optional[int] = None,
 ) -> AlertLog:
     log = AlertLog(
         ticker=ticker,
@@ -91,6 +130,9 @@ def insert_alert(
         source=source,
         reasons=reasons or [],
     )
+    # user_id 컬럼이 alert_log 에 이미 있을 수도 있으니 setattr 안전하게
+    if user_id is not None and hasattr(log, "user_id"):
+        log.user_id = user_id  # type: ignore[attr-defined]
     db.add(log)
     db.commit()
     db.refresh(log)
@@ -169,16 +211,20 @@ def list_backtests(db: Session, ticker: Optional[str] = None, limit: int = 20) -
 # Position
 # ──────────────────────────────────────────────
 
-def list_positions(db: Session) -> Sequence[Position]:
-    return db.execute(
-        select(Position).order_by(Position.added_at.asc())
-    ).scalars().all()
+def list_positions(db: Session, user_id: Optional[int] = None) -> Sequence[Position]:
+    stmt = select(Position)
+    if user_id is not None:
+        stmt = stmt.where(Position.user_id == user_id)
+    return db.execute(stmt.order_by(Position.added_at.asc())).scalars().all()
 
 
-def get_position(db: Session, ticker: str) -> Optional[Position]:
-    return db.execute(
-        select(Position).where(Position.ticker == ticker)
-    ).scalar_one_or_none()
+def get_position(
+    db: Session, ticker: str, user_id: Optional[int] = None,
+) -> Optional[Position]:
+    stmt = select(Position).where(Position.ticker == ticker)
+    if user_id is not None:
+        stmt = stmt.where(Position.user_id == user_id)
+    return db.execute(stmt).scalar_one_or_none()
 
 
 def upsert_position(
@@ -189,9 +235,10 @@ def upsert_position(
     avg_cost: float,
     highest_milestone: float = 0.0,
     notes: Optional[str] = None,
+    user_id: Optional[int] = None,
 ) -> Position:
-    """있으면 갱신 (qty/avg_cost/notes/highest_milestone 모두), 없으면 추가."""
-    row = get_position(db, ticker)
+    """있으면 갱신, 없으면 추가. (user_id, ticker) 로 식별."""
+    row = get_position(db, ticker, user_id=user_id)
     if row:
         row.qty = qty
         row.avg_cost = avg_cost
@@ -201,7 +248,7 @@ def upsert_position(
     else:
         row = Position(
             ticker=ticker, qty=qty, avg_cost=avg_cost,
-            highest_milestone=highest_milestone, notes=notes,
+            highest_milestone=highest_milestone, notes=notes, user_id=user_id,
         )
         db.add(row)
     db.commit()
@@ -209,8 +256,10 @@ def upsert_position(
     return row
 
 
-def update_position_milestone(db: Session, ticker: str, milestone: float) -> Optional[Position]:
-    row = get_position(db, ticker)
+def update_position_milestone(
+    db: Session, ticker: str, milestone: float, user_id: Optional[int] = None,
+) -> Optional[Position]:
+    row = get_position(db, ticker, user_id=user_id)
     if not row:
         return None
     row.highest_milestone = milestone
@@ -219,8 +268,10 @@ def update_position_milestone(db: Session, ticker: str, milestone: float) -> Opt
     return row
 
 
-def delete_position(db: Session, ticker: str) -> bool:
-    row = get_position(db, ticker)
+def delete_position(
+    db: Session, ticker: str, user_id: Optional[int] = None,
+) -> bool:
+    row = get_position(db, ticker, user_id=user_id)
     if not row:
         return False
     db.delete(row)
@@ -238,6 +289,7 @@ def list_threshold_alerts(
     active_only: bool = True,
     metric_type: Optional[str] = None,
     ticker: Optional[str] = None,
+    user_id: Optional[int] = None,
 ) -> Sequence[ThresholdAlert]:
     stmt = select(ThresholdAlert)
     if active_only:
@@ -246,6 +298,8 @@ def list_threshold_alerts(
         stmt = stmt.where(ThresholdAlert.metric_type == metric_type)
     if ticker:
         stmt = stmt.where(ThresholdAlert.ticker == ticker)
+    if user_id is not None:
+        stmt = stmt.where(ThresholdAlert.user_id == user_id)
     stmt = stmt.order_by(ThresholdAlert.created_at.asc())
     return db.execute(stmt).scalars().all()
 
@@ -267,6 +321,7 @@ def insert_threshold_alert(
     priority: str = "MED",
     note: Optional[str] = None,
     re_arm_after_h: Optional[int] = None,
+    user_id: Optional[int] = None,
 ) -> ThresholdAlert:
     if abs_value is None and (ref_window is None or ref_pct is None):
         raise ValueError("abs_value 또는 (ref_window + ref_pct) 둘 중 하나는 필수")
@@ -289,6 +344,7 @@ def insert_threshold_alert(
         note=note,
         re_arm_after_h=re_arm_after_h,
         active=True,
+        user_id=user_id,
     )
     db.add(row)
     db.commit()
@@ -373,11 +429,13 @@ def re_arm_due_alerts(db: Session) -> int:
 # ──────────────────────────────────────────────
 
 def list_reminders(
-    db: Session, *, active_only: bool = True,
+    db: Session, *, active_only: bool = True, user_id: Optional[int] = None,
 ) -> Sequence[SellReminder]:
     stmt = select(SellReminder)
     if active_only:
         stmt = stmt.where(SellReminder.active.is_(True))
+    if user_id is not None:
+        stmt = stmt.where(SellReminder.user_id == user_id)
     stmt = stmt.order_by(SellReminder.target_date.asc())
     return db.execute(stmt).scalars().all()
 
@@ -393,6 +451,7 @@ def insert_reminder(
     target_date: datetime,
     notes: Optional[str] = None,
     days_before: int = 7,
+    user_id: Optional[int] = None,
 ) -> SellReminder:
     row = SellReminder(
         title=title,
@@ -400,6 +459,7 @@ def insert_reminder(
         notes=notes,
         days_before=days_before,
         active=True,
+        user_id=user_id,
     )
     db.add(row)
     db.commit()
@@ -508,6 +568,38 @@ def list_event_calibrations(db: Session) -> Sequence[EventCalibration]:
             EventCalibration.event_type.asc(), EventCalibration.ticker.asc()
         )
     ).scalars().all()
+
+
+# ──────────────────────────────────────────────
+# Feedback
+# ──────────────────────────────────────────────
+
+def insert_feedback(db: Session, *, text: str, user_id: Optional[int] = None) -> Feedback:
+    row = Feedback(text=text, user_id=user_id)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def list_feedback(
+    db: Session, *, pending_only: bool = False, user_id: Optional[int] = None,
+) -> Sequence[Feedback]:
+    stmt = select(Feedback)
+    if pending_only:
+        stmt = stmt.where(Feedback.done_at.is_(None))
+    if user_id is not None:
+        stmt = stmt.where(Feedback.user_id == user_id)
+    return db.execute(stmt.order_by(Feedback.created_at.desc())).scalars().all()
+
+
+def mark_feedback_done(db: Session, fid: int) -> bool:
+    row = db.get(Feedback, fid)
+    if not row:
+        return False
+    row.done_at = datetime.utcnow()
+    db.commit()
+    return True
 
 
 # ──────────────────────────────────────────────

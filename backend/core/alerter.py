@@ -228,21 +228,24 @@ class AlertEngine:
         self._enricher = enricher
         self._last_alert: dict[str, datetime] = {}
 
-    def _is_on_cooldown(self, ticker: str) -> bool:
-        last = self._last_alert.get(ticker)
+    def _is_on_cooldown(self, ticker: str, chat_id: Optional[str] = None) -> bool:
+        # 사용자별 쿨다운 — 같은 ticker라도 사용자가 다르면 별도
+        key = f"{chat_id or self._chat_id}|{ticker}"
+        last = self._last_alert.get(key)
         if last is None:
             return False
         elapsed = (datetime.utcnow() - last).total_seconds() / 60
         return elapsed < self._cooldown_min
 
-    def _send_telegram(self, message: str) -> bool:
+    def _send_telegram(self, message: str, target_chat_id: Optional[str] = None) -> bool:
         if not self._token or "YOUR_" in self._token:
             print("\n" + "=" * 50 + "\n" + message + "\n" + "=" * 50)
             return True
+        chat_id = target_chat_id or self._chat_id
         try:
             resp = requests.post(
                 f"https://api.telegram.org/bot{self._token}/sendMessage",
-                json={"chat_id": self._chat_id, "text": message, "parse_mode": "HTML"},
+                json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
                 timeout=10,
             )
             if not resp.ok:
@@ -257,7 +260,7 @@ class AlertEngine:
             log.error(f"Telegram 전송 네트워크 오류: {type(e).__name__}")
             return False
 
-    def _persist(self, signal: Signal, source: str) -> None:
+    def _persist(self, signal: Signal, source: str, user_id: Optional[int] = None) -> None:
         if not self._log_to_db:
             return
         ind = signal.indicators
@@ -297,48 +300,56 @@ class AlertEngine:
             log.warning(f"[AlertEngine] enrich 실패 — raw 알람으로 폴백: {e}")
             return None
 
-    def process(self, signal: Signal, source: str) -> bool:
+    def process(
+        self, signal: Signal, source: str,
+        target_chat_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ) -> bool:
         if signal.strength == SignalStrength.NONE:
             return False
 
-        if self._is_on_cooldown(signal.ticker):
-            log.info(f"[AlertEngine] {signal.ticker} 쿨다운 중 — 스킵")
+        if self._is_on_cooldown(signal.ticker, chat_id=target_chat_id):
+            log.info(f"[AlertEngine] {signal.ticker} 쿨다운 중 (chat={target_chat_id or 'OWNER'}) — 스킵")
             return False
 
         enrichment = self._maybe_enrich(signal, source)
         message = _format_message(signal, source, enrichment)
-        sent = self._send_telegram(message)
+        sent = self._send_telegram(message, target_chat_id=target_chat_id)
 
         if sent:
-            self._last_alert[signal.ticker] = datetime.utcnow()
-            self._persist(signal, source)
-            log.info(f"[AlertEngine] ✅ {signal.ticker} 알람 발송 ({signal.strength.value})")
+            key = f"{target_chat_id or self._chat_id}|{signal.ticker}"
+            self._last_alert[key] = datetime.utcnow()
+            self._persist(signal, source, user_id=user_id)
+            log.info(
+                f"[AlertEngine] ✅ {signal.ticker} 알람 발송 "
+                f"({signal.strength.value}, user={user_id})"
+            )
 
         return sent
 
-    def process_milestone(self, trigger: MilestoneTrigger) -> bool:
-        """
-        익절 마일스톤 발동 알림. PositionEvaluator가 이미 DB의 highest_milestone을
-        갱신한 상태로 trigger를 반환했음 — 여기서는 발송만.
-        """
+    def process_milestone(
+        self, trigger: MilestoneTrigger,
+        target_chat_id: Optional[str] = None,
+    ) -> bool:
+        """익절 마일스톤 발동 알림."""
         msg = _format_milestone_message(trigger)
-        sent = self._send_telegram(msg)
+        sent = self._send_telegram(msg, target_chat_id=target_chat_id)
         if sent:
             log.info(
                 f"[AlertEngine] 💰 milestone {trigger.position.ticker} "
-                f"+{trigger.return_pct*100:.1f}% (M={trigger.milestone}) 발송"
+                f"+{trigger.return_pct*100:.1f}% (M={trigger.milestone}) → chat={target_chat_id or 'OWNER'}"
             )
         return sent
 
-    def process_threshold(self, ev: AlertEvaluation) -> bool:
-        """
-        ThresholdAlert 평가 결과 처리. 트리거되면 발송 + DB에 비활성화 마킹.
-        쿨다운 없음 — 알림 자체가 1회성 (재무장은 re_arm_after_h 또는 수동).
-        """
+    def process_threshold(
+        self, ev: AlertEvaluation,
+        target_chat_id: Optional[str] = None,
+    ) -> bool:
+        """ThresholdAlert 평가 결과 처리. 트리거 시 발송 + DB 비활성화."""
         if not ev.triggered:
             return False
         msg = _format_threshold_message(ev)
-        sent = self._send_telegram(msg)
+        sent = self._send_telegram(msg, target_chat_id=target_chat_id)
         if sent:
             try:
                 db = SessionLocal()
@@ -351,8 +362,6 @@ class AlertEngine:
             except Exception as e:
                 log.warning(f"[AlertEngine] threshold #{ev.alert.id} 마킹 실패: {e}")
             log.info(
-                f"[AlertEngine] 🎯 threshold #{ev.alert.id} 발동 "
-                f"({ev.alert.metric_type} {ev.alert.ticker or ''} "
-                f"{ev.current_value:.4g} {ev.alert.direction} {ev.threshold:.4g})"
+                f"[AlertEngine] 🎯 threshold #{ev.alert.id} 발동 → chat={target_chat_id or 'OWNER'}"
             )
         return sent

@@ -15,6 +15,7 @@ from .threshold_alerts import ThresholdAlertEvaluator
 from .positions import PositionEvaluator
 from .market import MarketFetcher
 from backend.db import SessionLocal, crud
+from backend.db.models import User
 
 log = logging.getLogger(__name__)
 
@@ -43,19 +44,23 @@ class Scanner:
         self.market_fetcher = market_fetcher
         self.position_evaluator = position_evaluator
 
-    def _current_tickers(self) -> list[str]:
+    def _gather_users_and_watchlists(self) -> tuple[list[User], dict[int, set[str]]]:
+        """active 사용자 + 사용자별 watchlist ticker set."""
         db = SessionLocal()
         try:
-            items = crud.list_watchlist(db, active_only=True)
-            tickers = [i.ticker for i in items]
+            users = list(crud.list_users(db, active_only=True))
+            user_wl: dict[int, set[str]] = {}
+            for u in users:
+                items = crud.list_watchlist(db, active_only=True, user_id=u.id)
+                user_wl[u.id] = {i.ticker for i in items}
         finally:
             db.close()
-        if not tickers and self._fallback:
-            log.info(f"[Scanner] DB 워치리스트 비어있음 — fallback 사용: {self._fallback}")
-            return list(self._fallback)
-        return tickers
+        return users, user_wl
 
-    def scan_one(self, ticker: str) -> None:
+    def scan_one_for_users(
+        self, ticker: str, users: list[User], user_wl: dict[int, set[str]],
+    ) -> None:
+        """ticker 1번 fetch → 모든 사용자별 평가/발송."""
         source = self.provider.source_of(ticker)
         try:
             if not self.provider.is_market_open(ticker):
@@ -73,34 +78,65 @@ class Scanner:
                 f"RSI={rsi_str} | "
                 f"신호={signal.strength.value}"
             )
-            self.alerter.process(signal, source)
 
-            # ThresholdAlert 평가 (가격 레벨 알림)
-            if self.threshold_evaluator is not None:
-                try:
-                    evals = self.threshold_evaluator.evaluate_for_ticker(
-                        ticker, df, signal.price
-                    )
-                    for ev in evals:
-                        self.alerter.process_threshold(ev)
-                except Exception as e:
-                    log.error(f"[Scanner] {ticker} threshold 평가 실패: {e}")
+            for user in users:
+                interested = ticker in user_wl.get(user.id, set())
 
-            # Position 익절 마일스톤 평가
-            if self.position_evaluator is not None:
-                try:
-                    trigger = self.position_evaluator.evaluate(ticker, signal.price)
-                    if trigger:
-                        self.alerter.process_milestone(trigger)
-                except Exception as e:
-                    log.error(f"[Scanner] {ticker} milestone 평가 실패: {e}")
+                # DipBuy: watchlist 에 들어있는 사용자에게만
+                if interested:
+                    try:
+                        self.alerter.process(
+                            signal, source,
+                            target_chat_id=user.telegram_chat_id, user_id=user.id,
+                        )
+                    except Exception as e:
+                        log.error(f"[Scanner] {ticker} dip user={user.id} 실패: {e}")
+
+                # ThresholdAlert: 사용자별 룰 (watchlist 무관 — 본인이 등록한 것만)
+                if self.threshold_evaluator is not None:
+                    try:
+                        evals = self.threshold_evaluator.evaluate_for_ticker(
+                            ticker, df, signal.price, user_id=user.id,
+                        )
+                        for ev in evals:
+                            self.alerter.process_threshold(
+                                ev, target_chat_id=user.telegram_chat_id,
+                            )
+                    except Exception as e:
+                        log.error(f"[Scanner] {ticker} threshold user={user.id} 실패: {e}")
+
+                # Position 마일스톤: 사용자별 평단
+                if self.position_evaluator is not None:
+                    try:
+                        trig = self.position_evaluator.evaluate(
+                            ticker, signal.price, user_id=user.id,
+                        )
+                        if trig:
+                            self.alerter.process_milestone(
+                                trig, target_chat_id=user.telegram_chat_id,
+                            )
+                    except Exception as e:
+                        log.error(f"[Scanner] {ticker} milestone user={user.id} 실패: {e}")
 
         except Exception as e:
             log.error(f"[Scanner] {ticker} 오류: {e}")
 
     def scan_all(self) -> None:
-        tickers = self._current_tickers()
-        log.info(f"── 전체 스캔 시작 ({len(tickers)}개 종목) ──")
+        users, user_wl = self._gather_users_and_watchlists()
+        all_tickers = sorted({t for s in user_wl.values() for t in s})
+
+        if not all_tickers and self._fallback:
+            log.info(f"[Scanner] 사용자 watchlist 비어있음 — fallback: {self._fallback}")
+            all_tickers = list(self._fallback)
+            # fallback 의 경우 OWNER 만 알림 (있다면)
+            owners = [u for u in users if u.tier == "OWNER"]
+            users = owners or users
+            user_wl = {u.id: set(all_tickers) for u in users}
+
+        log.info(
+            f"── 전체 스캔 시작 — 사용자 {len(users)}명, "
+            f"unique ticker {len(all_tickers)}개 ──"
+        )
 
         # 시간 경과한 알림 자동 재무장
         if self.threshold_evaluator is not None:
@@ -115,16 +151,21 @@ class Scanner:
             except Exception as e:
                 log.warning(f"[Scanner] 재무장 실패: {e}")
 
-        for ticker in tickers:
-            self.scan_one(ticker)
+        for ticker in all_tickers:
+            self.scan_one_for_users(ticker, users, user_wl)
 
-        # 시장 게이지 알림 (VIX / F&G) — 사이클당 1회
+        # 시장 게이지 알림 (VIX / F&G) — 사이클당 1회 fetch, 사용자별 룰 평가
         if self.threshold_evaluator is not None and self.market_fetcher is not None:
             try:
                 snap = self.market_fetcher.fetch()
-                evals = self.threshold_evaluator.evaluate_market_gauges(snap)
-                for ev in evals:
-                    self.alerter.process_threshold(ev)
+                for user in users:
+                    evals = self.threshold_evaluator.evaluate_market_gauges(
+                        snap, user_id=user.id,
+                    )
+                    for ev in evals:
+                        self.alerter.process_threshold(
+                            ev, target_chat_id=user.telegram_chat_id,
+                        )
             except Exception as e:
                 log.error(f"[Scanner] 게이지 평가 실패: {e}")
 

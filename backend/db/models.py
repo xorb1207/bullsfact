@@ -12,17 +12,23 @@ class Watchlist(Base):
     __tablename__ = "watchlist"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    ticker = Column(String(32), nullable=False, unique=True, index=True)
+    user_id = Column(Integer, nullable=True, index=True)         # User.id (마이그레이션 후 NOT NULL 효과)
+    ticker = Column(String(32), nullable=False, index=True)
     source = Column(String(16), nullable=False)  # "yfinance" | "binance"
     name = Column(String(128), nullable=True)    # 회사명 (yfinance.info.longName)
     added_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     active = Column(Boolean, nullable=False, default=True)
 
 
+# (user_id, ticker) 검색 가속
+Index("ix_watchlist_user_ticker", Watchlist.user_id, Watchlist.ticker)
+
+
 class AlertLog(Base):
     __tablename__ = "alert_log"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=True, index=True)             # User.id (사용자별 발동 이력)
     ticker = Column(String(32), nullable=False, index=True)
     strength = Column(String(16), nullable=False)  # "weak" | "strong"
     price = Column(Float, nullable=False)
@@ -59,20 +65,24 @@ Index("ix_alert_log_ticker_sent", AlertLog.ticker, AlertLog.sent_at.desc())
 
 class Position(Base):
     """
-    보유 포지션. 매매전략 MD §4 익절 룰의 입력.
+    보유 포지션. 사용자별 — 가족 각자 자기 평단/마일스톤.
     수익률 = current_price / avg_cost - 1 이 마일스톤(0.5/1.0/2.0/4.0/6.0)을
     돌파하면 알림. 가장 높이 도달한 마일스톤만 저장 (한 번 알림 → 다음 마일스톤만 감시).
     """
     __tablename__ = "position"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    ticker = Column(String(32), nullable=False, unique=True, index=True)
-    qty = Column(Float, nullable=False)                            # 보유 수량 (fractional 허용)
-    avg_cost = Column(Float, nullable=False)                       # 평단가 (USD)
-    highest_milestone = Column(Float, nullable=False, default=0.0) # 0.5 = +50% 발동, ...
+    user_id = Column(Integer, nullable=True, index=True)           # User.id
+    ticker = Column(String(32), nullable=False, index=True)
+    qty = Column(Float, nullable=False)
+    avg_cost = Column(Float, nullable=False)
+    highest_milestone = Column(Float, nullable=False, default=0.0)
     notes = Column(String(512), nullable=True)
     added_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+Index("ix_position_user_ticker", Position.user_id, Position.ticker)
 
 
 class ThresholdAlert(Base):
@@ -95,6 +105,7 @@ class ThresholdAlert(Base):
     __tablename__ = "threshold_alert"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=True, index=True)           # User.id
     metric_type = Column(String(16), nullable=False, index=True)
     ticker = Column(String(32), nullable=True, index=True)        # price 일 때만
     direction = Column(String(8), nullable=False)                  # "above" | "below"
@@ -127,6 +138,7 @@ class SellReminder(Base):
     __tablename__ = "sell_reminder"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=True, index=True)           # User.id
     title = Column(String(128), nullable=False)        # "1차 매도 — TQQQ 15 + SOXL 5"
     target_date = Column(DateTime, nullable=False, index=True)
     notes = Column(String(512), nullable=True)         # "차익 ~$1,390 (공제 내)"
@@ -205,6 +217,20 @@ class User(Base):
     llm_daily_cap_usd = Column(Float, nullable=True)           # tier default override
     active = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class Feedback(Base):
+    """
+    사용자 의견/제안 — 가족 needs 발굴.
+    /feedback 명령으로 누적, /admin feedback list 로 본인이 검토.
+    """
+    __tablename__ = "feedback"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, nullable=True, index=True)
+    text = Column(String(2048), nullable=False)
+    done_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
 
 class LLMCallLog(Base):

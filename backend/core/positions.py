@@ -72,11 +72,13 @@ class PositionEvaluator:
     매 호출마다 DB 세션 새로 열고 닫음.
     """
 
-    def evaluate(self, ticker: str, current_price: float) -> Optional[MilestoneTrigger]:
+    def evaluate(
+        self, ticker: str, current_price: float, user_id: Optional[int] = None,
+    ) -> Optional[MilestoneTrigger]:
         """현재가 기준으로 다음 마일스톤 도달 여부 평가. 트리거 시 DB 갱신."""
         db = SessionLocal()
         try:
-            pos = crud.get_position(db, ticker)
+            pos = crud.get_position(db, ticker, user_id=user_id)
             if not pos:
                 return None
             if pos.avg_cost <= 0:
@@ -89,7 +91,7 @@ class PositionEvaluator:
                 return None
 
             ms, sell_ratio, cum, label = nxt
-            crud.update_position_milestone(db, ticker, ms)
+            crud.update_position_milestone(db, ticker, ms, user_id=user_id)
 
             return MilestoneTrigger(
                 position=pos,

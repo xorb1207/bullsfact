@@ -59,13 +59,16 @@ logging.basicConfig(
 @dataclass
 class BotContext:
     token: str
-    allowed_chat_id: str
+    allowed_chat_id: str                     # OWNER chat_id (브로드캐스트 디폴트)
     provider: DataProvider
     strategy: DipBuyStrategy
     alerter: AlertEngine
     market: MarketFetcher
     llm: Optional[LLMClient] = None         # 매크로 해설 / on-demand 분석에 사용
     calendar: Optional[CalendarFetcher] = None  # M1: 이벤트 캘린더 (어닝/매크로/공시)
+    # Request-scoped — _process_update 에서 채워짐. handler 안에서 본인 user/chat_id 식별용
+    current_user: Optional[User] = None
+    current_chat_id: Optional[str] = None
 
 
 # ──────────────────────────────────────────────
@@ -85,7 +88,11 @@ def _api(ctx: BotContext, method: str, **payload) -> dict:
 
 
 def send(ctx: BotContext, text: str, chat_id: str | None = None) -> None:
-    target = chat_id or ctx.allowed_chat_id
+    """
+    명시적 chat_id 우선. 없으면 현재 요청자(ctx.current_chat_id), 그것도 없으면 OWNER.
+    명령 응답은 자연히 보낸 사람에게 가고, 스케줄러/알림은 chat_id 명시.
+    """
+    target = chat_id or getattr(ctx, "current_chat_id", None) or ctx.allowed_chat_id
     _api(ctx, "sendMessage", chat_id=target, text=text, parse_mode="HTML",
          disable_web_page_preview=True)
 
@@ -162,9 +169,10 @@ def cmd_help(args: list[str], ctx: BotContext) -> str:
 
 
 def cmd_list(args: list[str], ctx: BotContext) -> str:
+    user_id = _resolve_user_id(ctx)
     db = SessionLocal()
     try:
-        items = crud.list_watchlist(db, active_only=False)
+        items = crud.list_watchlist(db, active_only=False, user_id=user_id)
     finally:
         db.close()
 
@@ -325,13 +333,13 @@ def cmd_add(args: list[str], ctx: BotContext) -> str:
     if not args:
         return "사용법: <code>/add TICKER</code> (예: /add NVDA, /add ETH/USDT, /add 005930.KS)"
     ticker = args[0].strip().upper()
-    # 크립토 슬래시는 대소문자 보존 X — 포맷만 체크
     if "/" not in ticker and "-" not in ticker:
         ticker = ticker.upper()
+    user_id = _resolve_user_id(ctx)
 
     db = SessionLocal()
     try:
-        existing = crud.get_watchlist_item(db, ticker=ticker)
+        existing = crud.get_watchlist_item(db, ticker=ticker, user_id=user_id)
         if existing:
             if existing.active:
                 return f"이미 등록됨: <b>{_esc(ticker)}</b>"
@@ -341,8 +349,14 @@ def cmd_add(args: list[str], ctx: BotContext) -> str:
         except Exception:
             return f"⚠️ <b>{_esc(ticker)}</b> 라우팅 불가 — yfinance/binance 어느 쪽도 매칭 안 됨"
 
-        name = _fetch_ticker_name(ticker, source)
-        crud.add_watchlist(db, ticker=ticker, source=source, name=name)
+        # 회사명 캐싱 — 다른 사용자가 이미 캐시했으면 재사용
+        name = None
+        any_existing = crud.get_any_watchlist_item(db, ticker)
+        if any_existing and any_existing.name:
+            name = any_existing.name
+        else:
+            name = _fetch_ticker_name(ticker, source)
+        crud.add_watchlist(db, ticker=ticker, source=source, name=name, user_id=user_id)
         name_str = f"  <i>{_esc(name)}</i>" if name else ""
         return f"✅ 추가됨: <b>{_esc(ticker)}</b> ({source}){name_str}"
     finally:
@@ -353,9 +367,10 @@ def cmd_remove(args: list[str], ctx: BotContext) -> str:
     if not args:
         return "사용법: <code>/remove TICKER</code>"
     ticker = args[0].strip().upper()
+    user_id = _resolve_user_id(ctx)
     db = SessionLocal()
     try:
-        ok = crud.remove_watchlist(db, ticker=ticker)
+        ok = crud.remove_watchlist(db, ticker=ticker, user_id=user_id)
         return f"🗑️ 삭제됨: <b>{_esc(ticker)}</b>" if ok else f"❌ 없음: <b>{_esc(ticker)}</b>"
     finally:
         db.close()
@@ -472,10 +487,13 @@ def cmd_market(args: list[str], ctx: BotContext) -> str:
 
 
 def send_market_report(ctx: BotContext) -> None:
-    """매일 자동 발송 (스케줄러 호출). 시장 스냅샷 + LLM 매크로 해설."""
+    """
+    매일 자동 발송 (스케줄러 호출).
+    - 매크로 해설/시장 스냅샷은 모든 사용자 공통 (캐시 hit으로 LLM 1회만 호출)
+    - 매도 리마인더는 사용자별 (개인 일정)
+    """
     try:
         log.info("[scheduler] 매일 시장 리포트 발송")
-        # M3 부가: 알림 후속 추적 — 매일 1회 갱신 (브리핑 발송 전, 무관 실패 격리)
         try:
             n = update_returns()
             if n:
@@ -484,30 +502,39 @@ def send_market_report(ctx: BotContext) -> None:
             log.error(f"[scheduler] 후속 추적 실패 (무시): {type(e).__name__}: {e}")
 
         snap = ctx.market.fetch()
-        text = "🌅 <b>모닝 브리핑</b>\n\n" + format_market(snap)
+        common_text = "🌅 <b>모닝 브리핑</b>\n\n" + format_market(snap)
 
-        # 매크로 해설 (LLM + web_search) — 실패해도 본 브리핑은 발송
         if ctx.llm is not None:
             try:
                 briefing = generate_daily_recap(ctx.llm, snap)
                 if briefing:
-                    text += "\n\n" + format_macro(briefing)
+                    common_text += "\n\n" + format_macro(briefing)
                     log.info(f"[scheduler] 매크로 해설 추가 (cost ${briefing.cost_usd:.4f})")
                 else:
                     log.warning("[scheduler] 매크로 해설 생성 실패 — 스킵")
             except Exception as e:
                 log.error(f"[scheduler] 매크로 해설 예외 (무시): {type(e).__name__}: {e}")
 
-        # 매도 캘린더 임박 항목 (양도세 분할 매도 등) — 실패해도 본 브리핑은 발송
+        # active 사용자 전체에게 broadcast (개인 매도 리마인더는 사용자별 첨부)
+        db = SessionLocal()
         try:
-            due = get_due_reminders()
-            if due:
-                text += "\n" + format_reminders(due)
-                log.info(f"[scheduler] 매도 리마인더 {len(due)}건 첨부")
-        except Exception as e:
-            log.error(f"[scheduler] 리마인더 예외 (무시): {type(e).__name__}: {e}")
+            users = list(crud.list_users(db, active_only=True))
+        finally:
+            db.close()
 
-        send(ctx, text)
+        for user in users:
+            text = common_text
+            try:
+                due = get_due_reminders(user_id=user.id)
+                if due:
+                    text += "\n" + format_reminders(due)
+            except Exception as e:
+                log.error(f"[scheduler] reminders user={user.id} 실패 (무시): {e}")
+            try:
+                send(ctx, text, chat_id=user.telegram_chat_id)
+                log.info(f"[scheduler] 브리핑 → user={user.id} ({user.name})")
+            except Exception as e:
+                log.error(f"[scheduler] 브리핑 발송 실패 user={user.id}: {e}")
     except Exception as e:
         log.error(f"[scheduler] 매일 시장 리포트 실패: {e}\n{traceback.format_exc()}")
 
@@ -564,7 +591,7 @@ def _parse_pct(token: str) -> Optional[float]:
 _VALID_REF = {"high_252d", "low_252d", "ema_50d"}
 
 
-def _cmd_alert_add(args: list[str]) -> str:
+def _cmd_alert_add(args: list[str], user_id: Optional[int] = None) -> str:
     """args[0]은 'add' 가 이미 빠진 상태. 즉 args = [metric_type, ...]."""
     if not args:
         return _ALERT_HELP
@@ -611,7 +638,7 @@ def _cmd_alert_add(args: list[str]) -> str:
 
             row = crud.insert_threshold_alert(
                 db, metric_type="price", ticker=ticker, direction=direction,
-                tier=tier, priority=priority, note=note, **kwargs,
+                tier=tier, priority=priority, note=note, user_id=user_id, **kwargs,
             )
             return f"✅ 알림 #{row.id} 등록: <b>{_esc(ticker)}</b> {direction} {_esc(args[3])}{('  ' + args[4]) if 'ref_window' in kwargs else ''}  [{priority}]{(' ' + tier) if tier else ''}"
 
@@ -634,7 +661,7 @@ def _cmd_alert_add(args: list[str]) -> str:
             note = " ".join(note_parts) if note_parts else None
             row = crud.insert_threshold_alert(
                 db, metric_type=metric, direction=direction, abs_value=abs_v,
-                priority=priority, note=note,
+                priority=priority, note=note, user_id=user_id,
             )
             return f"✅ 알림 #{row.id} 등록: <b>{metric.upper()}</b> {direction} {abs_v}  [{priority}]"
 
@@ -664,11 +691,11 @@ def _format_alert_row(a) -> str:
     return f"{pri_emoji} <b>#{a.id}</b> {_esc(head)} {_esc(cond)}{last}{status}{note}"
 
 
-def _cmd_alert_list(args: list[str]) -> str:
+def _cmd_alert_list(args: list[str], user_id: Optional[int] = None) -> str:
     show_all = bool(args and args[0].lower() == "all")
     db = SessionLocal()
     try:
-        rows = crud.list_threshold_alerts(db, active_only=not show_all)
+        rows = crud.list_threshold_alerts(db, active_only=not show_all, user_id=user_id)
     finally:
         db.close()
     if not rows:
@@ -711,12 +738,13 @@ def _cmd_alert_set_active(args: list[str], active: bool) -> str:
 def cmd_alert(args: list[str], ctx: BotContext) -> str:
     if not args:
         return _ALERT_HELP
+    user_id = _resolve_user_id(ctx)
     sub = args[0].lower()
     rest = args[1:]
     if sub == "list":
-        return _cmd_alert_list(rest)
+        return _cmd_alert_list(rest, user_id=user_id)
     if sub == "add":
-        return _cmd_alert_add(rest)
+        return _cmd_alert_add(rest, user_id=user_id)
     if sub in ("remove", "rm", "delete"):
         return _cmd_alert_remove(rest)
     if sub == "pause":
@@ -766,11 +794,12 @@ def _next_milestone_label(highest: float, current_pct: float) -> str:
 
 
 def _cmd_position_list(ctx: BotContext) -> str:
+    user_id = _resolve_user_id(ctx)
     db = SessionLocal()
     try:
-        rows = crud.list_positions(db)
+        rows = crud.list_positions(db, user_id=user_id)
         if not rows:
-            return "등록된 포지션 없음. <code>/position add TICKER QTY AVG_COST</code> 로 추가."
+            return "등록된 포지션 없음. <code>/portfolio add TICKER QTY AVG_COST</code> 로 추가."
         return _format_position_list(rows, db, ctx)
     finally:
         db.close()
@@ -873,11 +902,12 @@ def _cmd_position_add(
         return "수량과 평단은 양수여야 함"
 
     notes = " ".join(args[3:]) if len(args) > 3 else None
+    user_id = _resolve_user_id(ctx)
 
     # 중복 검사
     db = SessionLocal()
     try:
-        existing = crud.get_position(db, ticker)
+        existing = crud.get_position(db, ticker, user_id=user_id)
     finally:
         db.close()
 
@@ -909,7 +939,7 @@ def _cmd_position_add(
     try:
         crud.upsert_position(
             db, ticker=ticker, qty=qty, avg_cost=avg_cost,
-            highest_milestone=skip_to, notes=notes,
+            highest_milestone=skip_to, notes=notes, user_id=user_id,
         )
     finally:
         db.close()
@@ -925,13 +955,14 @@ def _cmd_position_update(args: list[str], ctx: BotContext) -> str:
     return _cmd_position_add(args, ctx, allow_overwrite=True)
 
 
-def _cmd_position_remove(args: list[str]) -> str:
+def _cmd_position_remove(args: list[str], ctx: BotContext) -> str:
     if not args:
-        return "사용법: <code>/position remove TICKER</code>"
+        return "사용법: <code>/portfolio remove TICKER</code>"
     ticker = args[0].upper()
+    user_id = _resolve_user_id(ctx)
     db = SessionLocal()
     try:
-        ok = crud.delete_position(db, ticker)
+        ok = crud.delete_position(db, ticker, user_id=user_id)
     finally:
         db.close()
     return f"🗑️ 포지션 삭제: <b>{_esc(ticker)}</b>" if ok else f"❌ 없음: <b>{_esc(ticker)}</b>"
@@ -960,7 +991,7 @@ def cmd_portfolio(args: list[str], ctx: BotContext) -> str:
     if sub == "update":
         return _cmd_position_update(rest, ctx)
     if sub in ("remove", "rm", "delete"):
-        return _cmd_position_remove(rest)
+        return _cmd_position_remove(rest, ctx)
     if sub in ("help", "?"):
         return _PORTFOLIO_HELP
     return f"알 수 없는 하위 명령: <code>{_esc(sub)}</code>\n\n" + _PORTFOLIO_HELP
@@ -1035,9 +1066,10 @@ def _format_exposure(expo: PortfolioExposure) -> str:
 
 def _cmd_exposure_inner(ctx: BotContext) -> str:
     """exposure 본문 — /portfolio exposure 와 /exposure (backcompat) 둘 다에서 호출."""
+    user_id = _resolve_user_id(ctx)
     db = SessionLocal()
     try:
-        positions = crud.list_positions(db)
+        positions = crud.list_positions(db, user_id=user_id)
     finally:
         db.close()
     if not positions:
@@ -1066,7 +1098,10 @@ def cmd_exposure(args: list[str], ctx: BotContext) -> str:
 # ──────────────────────────────────────────────
 
 def _resolve_user_id(ctx: BotContext) -> Optional[int]:
-    """현재 ctx.allowed_chat_id 의 User.id 조회. 없으면 None."""
+    """현재 요청자(ctx.current_user) → User.id. _process_update가 채워두지 못했으면 OWNER fallback."""
+    if ctx.current_user is not None:
+        return ctx.current_user.id
+    # 스케줄러나 fallback 경로 — OWNER
     db = SessionLocal()
     try:
         u = crud.get_user_by_chat_id(db, ctx.allowed_chat_id)
@@ -1144,11 +1179,11 @@ def _parse_date(s: str):
     return None
 
 
-def _cmd_reminder_list(args: list[str]) -> str:
+def _cmd_reminder_list(args: list[str], user_id: Optional[int] = None) -> str:
     show_all = bool(args and args[0].lower() == "all")
     db = SessionLocal()
     try:
-        rows = crud.list_reminders(db, active_only=not show_all)
+        rows = crud.list_reminders(db, active_only=not show_all, user_id=user_id)
     finally:
         db.close()
     if not rows:
@@ -1176,7 +1211,7 @@ def _cmd_reminder_list(args: list[str]) -> str:
     return "\n".join(lines)
 
 
-def _cmd_reminder_add(args: list[str]) -> str:
+def _cmd_reminder_add(args: list[str], user_id: Optional[int] = None) -> str:
     if len(args) < 2:
         return "사용법: <code>/reminder add 2026-06-15 1차 매도 (TQQQ 15+SOXL 5)</code>"
     target = _parse_date(args[0])
@@ -1195,7 +1230,9 @@ def _cmd_reminder_add(args: list[str]) -> str:
         notes = None
     db = SessionLocal()
     try:
-        row = crud.insert_reminder(db, title=title, target_date=target, notes=notes)
+        row = crud.insert_reminder(
+            db, title=title, target_date=target, notes=notes, user_id=user_id,
+        )
     finally:
         db.close()
     return f"✅ 리마인더 #{row.id} 등록: <b>{_esc(title)}</b> ({target.strftime('%Y-%m-%d')})"
@@ -1234,12 +1271,13 @@ def _cmd_reminder_remove(args: list[str]) -> str:
 def cmd_reminder(args: list[str], ctx: BotContext) -> str:
     if not args:
         return _REMINDER_HELP
+    user_id = _resolve_user_id(ctx)
     sub = args[0].lower()
     rest = args[1:]
     if sub == "list":
-        return _cmd_reminder_list(rest)
+        return _cmd_reminder_list(rest, user_id=user_id)
     if sub == "add":
-        return _cmd_reminder_add(rest)
+        return _cmd_reminder_add(rest, user_id=user_id)
     if sub == "done":
         return _cmd_reminder_done(rest)
     if sub in ("remove", "rm", "delete"):
@@ -1247,6 +1285,184 @@ def cmd_reminder(args: list[str], ctx: BotContext) -> str:
     if sub in ("help", "?"):
         return _REMINDER_HELP
     return f"알 수 없는 하위 명령: <code>{_esc(sub)}</code>\n\n" + _REMINDER_HELP
+
+
+# ──────────────────────────────────────────────
+# Tier 권한 매핑
+# ──────────────────────────────────────────────
+
+# OWNER 만 허용되는 명령 — 시스템/관리/시드 변경
+_OWNER_ONLY = {"admin", "test"}
+
+# OWNER + TRUSTED 허용 — 데이터 변경 (자기 데이터)
+_OWNER_TRUSTED = {
+    "add", "remove", "rm",
+    "portfolio", "port", "position", "pos",
+    "alert", "reminder", "remind",
+    "feedback",
+}
+
+# 모든 tier 허용 (LIMITED 포함) — 정보 조회 only
+# (그 외 명령은 모두 LIMITED 도 가능)
+
+
+def _can_use(user_tier: str, cmd: str) -> bool:
+    if cmd in _OWNER_ONLY:
+        return user_tier == "OWNER"
+    if cmd in _OWNER_TRUSTED:
+        return user_tier in ("OWNER", "TRUSTED")
+    # 정보 조회 명령 — 모두 OK
+    return True
+
+
+# ──────────────────────────────────────────────
+# /admin — OWNER 전용 사용자/피드백 관리
+# ──────────────────────────────────────────────
+
+_ADMIN_HELP = (
+    "<b>🛠 관리자 명령</b>\n"
+    "━━━━━━━━━━━━━━━━━\n"
+    "<b>/admin user list</b>\n"
+    "<b>/admin user add CHAT_ID TIER [이름]</b>\n"
+    "  TIER: OWNER | TRUSTED | LIMITED\n"
+    "<b>/admin user tier ID NEW_TIER</b>\n"
+    "<b>/admin user remove ID</b>\n\n"
+    "<b>/admin feedback list</b>  (대기만)\n"
+    "<b>/admin feedback all</b>  (전체)\n"
+    "<b>/admin feedback done ID</b>"
+)
+
+
+def _cmd_admin_user(args: list[str], ctx: BotContext) -> str:
+    if not args:
+        return _ADMIN_HELP
+    sub = args[0].lower()
+    rest = args[1:]
+    db = SessionLocal()
+    try:
+        if sub == "list":
+            users = crud.list_users(db, active_only=False)
+            if not users:
+                return "사용자 없음"
+            lines = ["<b>사용자 목록</b>", "━━━━━━━━━━━━━━━━━"]
+            for u in users:
+                status = "" if u.active else " <i>(비활성)</i>"
+                cap_override = f" cap=${u.llm_daily_cap_usd:.2f}" if u.llm_daily_cap_usd else ""
+                lines.append(
+                    f"#{u.id} <b>{_esc(u.name or '?')}</b> "
+                    f"[{u.tier}] chat={u.telegram_chat_id}{cap_override}{status}"
+                )
+            return "\n".join(lines)
+        if sub == "add":
+            if len(rest) < 2:
+                return "사용법: <code>/admin user add CHAT_ID TIER [이름]</code>"
+            chat_id, tier = rest[0], rest[1].upper()
+            if tier not in ("OWNER", "TRUSTED", "LIMITED"):
+                return f"⚠️ TIER 오류: <code>{_esc(tier)}</code> (OWNER/TRUSTED/LIMITED)"
+            name = " ".join(rest[2:]) if len(rest) > 2 else None
+            row = crud.upsert_user(db, telegram_chat_id=chat_id, tier=tier, name=name)
+            return f"✅ 사용자 #{row.id} 등록: <b>{_esc(name or '?')}</b> [{tier}] chat={chat_id}"
+        if sub == "tier":
+            if len(rest) < 2:
+                return "사용법: <code>/admin user tier ID NEW_TIER</code>"
+            try:
+                uid = int(rest[0])
+            except ValueError:
+                return f"ID 파싱 실패: {_esc(rest[0])}"
+            new_tier = rest[1].upper()
+            if new_tier not in ("OWNER", "TRUSTED", "LIMITED"):
+                return f"⚠️ TIER 오류: <code>{_esc(new_tier)}</code>"
+            user = db.get(User, uid)
+            if not user:
+                return f"❌ 없음: #{uid}"
+            user.tier = new_tier
+            db.commit()
+            return f"✅ #{uid} → {new_tier}"
+        if sub == "remove":
+            if not rest:
+                return "사용법: <code>/admin user remove ID</code>"
+            try:
+                uid = int(rest[0])
+            except ValueError:
+                return f"ID 파싱 실패: {_esc(rest[0])}"
+            user = db.get(User, uid)
+            if not user:
+                return f"❌ 없음: #{uid}"
+            if user.tier == "OWNER":
+                return "⚠️ OWNER는 삭제 불가 (안전장치)"
+            user.active = False
+            db.commit()
+            return f"🗑️ #{uid} 비활성"
+        return _ADMIN_HELP
+    finally:
+        db.close()
+
+
+def _cmd_admin_feedback(args: list[str], ctx: BotContext) -> str:
+    if not args:
+        args = ["list"]
+    sub = args[0].lower()
+    rest = args[1:]
+    db = SessionLocal()
+    try:
+        if sub in ("list", "all"):
+            pending_only = (sub == "list")
+            rows = crud.list_feedback(db, pending_only=pending_only)
+            if not rows:
+                return "피드백 없음" if pending_only else "전체 피드백 없음"
+            lines = [f"<b>피드백</b> {'(대기)' if pending_only else '(전체)'}",
+                     "━━━━━━━━━━━━━━━━━"]
+            for f in rows[:20]:
+                user = db.get(User, f.user_id) if f.user_id else None
+                who = (user.name or f"#{f.user_id}") if user else "anonymous"
+                done = "✅ " if f.done_at else ""
+                lines.append(f"{done}<b>#{f.id}</b> [{_esc(who)}] {f.created_at:%m-%d %H:%M}")
+                lines.append(f"   {_esc(f.text)}")
+            return "\n".join(lines)
+        if sub == "done":
+            if not rest:
+                return "사용법: <code>/admin feedback done ID</code>"
+            try:
+                fid = int(rest[0])
+            except ValueError:
+                return f"ID 파싱 실패: {_esc(rest[0])}"
+            ok = crud.mark_feedback_done(db, fid)
+            return f"✅ 피드백 #{fid} 완료" if ok else f"❌ 없음: #{fid}"
+        return _ADMIN_HELP
+    finally:
+        db.close()
+
+
+def cmd_admin(args: list[str], ctx: BotContext) -> str:
+    if not args:
+        return _ADMIN_HELP
+    sub = args[0].lower()
+    rest = args[1:]
+    if sub == "user":
+        return _cmd_admin_user(rest, ctx)
+    if sub == "feedback":
+        return _cmd_admin_feedback(rest, ctx)
+    return _ADMIN_HELP
+
+
+# ──────────────────────────────────────────────
+# /feedback — 가족 needs 발굴
+# ──────────────────────────────────────────────
+
+def cmd_feedback(args: list[str], ctx: BotContext) -> str:
+    if not args:
+        return ("사용법: <code>/feedback 의견 또는 제안</code>\n"
+                "예: <code>/feedback /list 에 한국 시장 분리 표시 원함</code>")
+    text = " ".join(args).strip()
+    if not text:
+        return "내용을 적어주세요"
+    user_id = ctx.current_user.id if ctx.current_user else None
+    db = SessionLocal()
+    try:
+        row = crud.insert_feedback(db, text=text, user_id=user_id)
+    finally:
+        db.close()
+    return f"✅ 피드백 #{row.id} 접수. 검토 후 반영합니다 🙏"
 
 
 def cmd_test(args: list[str], ctx: BotContext) -> str:
@@ -1316,6 +1532,10 @@ COMMANDS: dict[str, Callable[[list[str], BotContext], str]] = {
     "test":   cmd_test,
     "help":   cmd_help,
     "start":  cmd_help,            # alias
+
+    # 멀티유저
+    "feedback": cmd_feedback,
+    "admin":  cmd_admin,           # OWNER 전용 (권한 체크는 _can_use)
 }
 
 # Telegram 자동완성 메뉴 — 핵심 8개만. 시스템성/alias 는 제외.
@@ -1402,10 +1622,12 @@ def _try_multiline_bulk(text: str, ctx: BotContext) -> Optional[str]:
     cmd = first_parts[0].split("@")[0].lower()
     sub = first_parts[1].lower()
 
-    # /position add (또는 /pos add)
-    if cmd in ("position", "pos") and sub == "add":
+    # 모든 멀티라인 일괄 처리는 user-scoped
+    user_id = _resolve_user_id(ctx)
+
+    # /portfolio add (또는 /position add, /pos add)
+    if cmd in ("portfolio", "port", "position", "pos") and sub == "add":
         results: list[str] = []
-        # 첫 줄에 인자가 더 있으면 그것도 처리 (e.g. "/position add SOXL 23 21.47")
         first_extra = first_parts[2:]
         if first_extra:
             results.append(_cmd_position_add(first_extra, ctx))
@@ -1416,17 +1638,17 @@ def _try_multiline_bulk(text: str, ctx: BotContext) -> Optional[str]:
             results.append(_cmd_position_add(tokens, ctx))
         return _summarize_bulk(results, label="포지션")
 
-    # /alert add price ... (멀티라인은 'price' 모드에서만 의미. vix/fg는 단발이라 굳이)
+    # /alert add
     if cmd == "alert" and sub == "add":
         results = []
         first_extra = first_parts[2:]
         if first_extra:
-            results.append(_cmd_alert_add(first_extra))
+            results.append(_cmd_alert_add(first_extra, user_id=user_id))
         for line in lines[1:]:
             tokens = line.split()
             if not tokens:
                 continue
-            results.append(_cmd_alert_add(tokens))
+            results.append(_cmd_alert_add(tokens, user_id=user_id))
         return _summarize_bulk(results, label="알림")
 
     return None
@@ -1457,11 +1679,31 @@ def _process_update(update: dict, ctx: BotContext) -> None:
     if not text:
         return
 
-    # 권한 체크
-    if chat_id != ctx.allowed_chat_id:
-        log.warning(f"unauthorized chat_id={chat_id} text={text[:30]!r}")
-        # 공격자에게 응답 안 함 (정보 누출 방지)
+    # 사용자 인증 — DB User 기반 (멀티유저)
+    db = SessionLocal()
+    try:
+        user = crud.get_user_by_chat_id(db, chat_id)
+    finally:
+        db.close()
+
+    if user is None or not user.active:
+        # 미등록 사용자 — onboarding 안내 (공격자 spam 방지 위해 짧게)
+        if text.startswith("/start") or text.startswith("/help"):
+            try:
+                _api(ctx, "sendMessage", chat_id=chat_id, parse_mode="HTML",
+                     text=(
+                         "<b>👋 bullsfact</b>\n"
+                         f"이 채팅 ID: <code>{chat_id}</code>\n"
+                         "관리자에게 위 ID를 전달하시면 등록해드립니다."
+                     ))
+            except Exception as e:
+                log.warning(f"onboarding 응답 실패: {e}")
+        else:
+            log.info(f"unauthorized chat_id={chat_id} text={text[:30]!r}")
         return
+
+    ctx.current_user = user
+    ctx.current_chat_id = chat_id
 
     if not text.startswith("/"):
         return  # 명령어 아니면 무시
@@ -1475,6 +1717,11 @@ def _process_update(update: dict, ctx: BotContext) -> None:
     parts = text[1:].split()
     cmd = parts[0].split("@")[0].lower()  # /add@bot_name 같은 형태 정리
     args = parts[1:]
+
+    # tier 권한 체크
+    if not _can_use(user.tier, cmd):
+        send(ctx, f"⚠️ 권한 없음 — <code>/{_esc(cmd)}</code> 는 {user.tier} 등급에서 사용 불가")
+        return
 
     handler = COMMANDS.get(cmd)
     if not handler:
@@ -1528,6 +1775,8 @@ def main() -> None:
             log.info(f"User OWNER 보장: #{owner.id} (chat_id={chat_id})")
         finally:
             db.close()
+        # OWNER 생성 후 init_db 재호출 → orphan(user_id NULL) 행을 OWNER 로 매핑
+        init_db()
     except Exception as e:
         log.error(f"User OWNER 생성 실패 (무시): {type(e).__name__}: {e}")
 

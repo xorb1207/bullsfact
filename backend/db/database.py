@@ -42,13 +42,15 @@ def _run_lightweight_migrations() -> None:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE watchlist ADD COLUMN name VARCHAR(128)"))
 
-    # alert_log post-mortem 컬럼 (M3 부가)
+    # alert_log post-mortem 컬럼 (M3 부가) + user_id (멀티유저)
     if "alert_log" in existing_tables:
         cols = {c["name"] for c in inspector.get_columns("alert_log")}
         with engine.begin() as conn:
             for col_name in ("price_7d", "price_30d", "return_7d", "return_30d"):
                 if col_name not in cols:
                     conn.execute(text(f"ALTER TABLE alert_log ADD COLUMN {col_name} FLOAT"))
+            if "user_id" not in cols:
+                conn.execute(text("ALTER TABLE alert_log ADD COLUMN user_id INTEGER"))
 
     # llm_call_log.user_id 추가 (멀티유저 비용 추적)
     if "llm_call_log" in existing_tables:
@@ -56,6 +58,41 @@ def _run_lightweight_migrations() -> None:
         if "user_id" not in cols:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE llm_call_log ADD COLUMN user_id INTEGER"))
+
+    # 멀티유저 마이그레이션 — 사용자별 데이터 분리
+    # 4개 테이블에 user_id 컬럼 추가 + 기존 행은 OWNER 소속으로 일괄 매핑
+    _migrate_to_multiuser_tables(inspector, existing_tables)
+
+
+def _migrate_to_multiuser_tables(inspector, existing_tables: list[str]) -> None:
+    """user_id 컬럼 추가 + 기존 데이터 OWNER 로 일괄 매핑.
+
+    OWNER User 가 없으면 매핑 스킵 (스키마만 추가). bot 시작 시 OWNER 생성되면
+    그때 다시 호출돼서 매핑 됨. idempotent.
+    """
+    from sqlalchemy import text
+    target_tables = ["watchlist", "position", "threshold_alert", "sell_reminder", "feedback"]
+
+    with engine.begin() as conn:
+        # 1. user_id 컬럼 추가 (없으면)
+        for tbl in target_tables:
+            if tbl not in existing_tables:
+                continue
+            cols = {c["name"] for c in inspector.get_columns(tbl)}
+            if "user_id" not in cols:
+                conn.execute(text(f"ALTER TABLE {tbl} ADD COLUMN user_id INTEGER"))
+
+        # 2. OWNER 가 있으면 user_id NULL 인 기존 행을 OWNER 소속으로
+        owner_row = conn.execute(
+            text("SELECT id FROM user WHERE tier='OWNER' ORDER BY id ASC LIMIT 1")
+        ).fetchone() if "user" in existing_tables else None
+        if owner_row:
+            owner_id = owner_row[0]
+            for tbl in target_tables:
+                if tbl not in existing_tables:
+                    continue
+                conn.execute(text(f"UPDATE {tbl} SET user_id = :uid WHERE user_id IS NULL"),
+                             {"uid": owner_id})
 
 
 def get_db():
