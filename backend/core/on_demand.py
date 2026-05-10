@@ -15,9 +15,68 @@ from typing import Optional
 
 import pandas as pd
 
+from datetime import datetime
+
 from .enrichment.llm_client import LLMClient, BudgetExceeded
 from .market import MarketSnapshot
 from backend.db import SessionLocal, crud
+
+
+# 캐시 TTL — 같은 키 안에서 반복 호출 방지
+_CACHE_TTL_TICKER_SEC = 30 * 60       # 30분
+_CACHE_TTL_MACRO_SEC = 60 * 60        # 1시간
+
+
+def _ticker_cache_key(ticker: str) -> str:
+    """30분 윈도 단위 — 같은 시간대 같은 ticker 는 캐시 hit."""
+    bucket = datetime.utcnow().strftime("%Y%m%d-%H") + ("a" if datetime.utcnow().minute < 30 else "b")
+    return f"{ticker.upper()}|{bucket}"
+
+
+def _macro_cache_key() -> str:
+    """1시간 윈도 단위."""
+    return datetime.utcnow().strftime("%Y%m%d-%H")
+
+
+def _try_cache_get(purpose: str, key: str) -> Optional["ResearchResult"]:
+    try:
+        db = SessionLocal()
+        try:
+            row = crud.get_llm_cache(db, purpose=purpose, cache_key=key)
+            if not row:
+                return None
+            data = row.result_text or {}
+            return ResearchResult(
+                title=data.get("title", ""),
+                text=data.get("text", ""),
+                citations=data.get("citations", []) or [],
+                cost_usd=0.0,   # 캐시 hit 은 신규 비용 0
+            )
+        finally:
+            db.close()
+    except Exception as e:
+        log.debug(f"[OnDemand] cache get 실패 (무시): {type(e).__name__}: {e}")
+        return None
+
+
+def _cache_put(purpose: str, key: str, result: "ResearchResult", ttl_sec: int) -> None:
+    try:
+        db = SessionLocal()
+        try:
+            crud.put_llm_cache(
+                db, purpose=purpose, cache_key=key,
+                result_text={
+                    "title": result.title,
+                    "text": result.text,
+                    "citations": result.citations,
+                },
+                cost_usd=result.cost_usd,
+                ttl_seconds=ttl_sec,
+            )
+        finally:
+            db.close()
+    except Exception as e:
+        log.debug(f"[OnDemand] cache put 실패 (무시): {type(e).__name__}: {e}")
 
 log = logging.getLogger(__name__)
 
@@ -37,9 +96,14 @@ class ResearchResult:
 _SYSTEM_TICKER = """You are a macro/equity analyst answering an individual Korean retail investor's question
 about why a specific ticker is moving recently.
 
+CRITICAL: Output ONLY the final answer. No meta-commentary, no thinking aloud,
+no "확인하겠습니다" / "분석해보겠습니다" / "다음과 같이..." prefixes.
+The user sees your output directly in Telegram.
+
 Output rules:
 - Korean, concise. Total under 700 characters.
 - Telegram HTML safe: <b></b> only. No <p>/<ul>/etc.
+- Start IMMEDIATELY with "<b>최근 동향</b>" — no preamble.
 - Structure exactly:
   • <b>최근 동향</b> — 1-2줄, 가격/변동폭 요약
   • <b>주요 원인 (가능성)</b> — 2-3 bullet, 각 1줄
@@ -51,6 +115,9 @@ Output rules:
 
 _SYSTEM_MACRO_NOW = """You are a macro market analyst giving a Korean retail investor a real-time read on
 current market conditions.
+
+CRITICAL: Output ONLY the final answer. No meta-commentary, no thinking aloud.
+Start IMMEDIATELY with "<b>현재 분위기</b>" — no preamble.
 
 Output rules:
 - Korean, concise. Total under 700 characters.
@@ -173,21 +240,41 @@ def _position_summary(ticker: str) -> Optional[str]:
         return None
 
 
+def _default_ticker_model() -> str:
+    import os
+    return os.getenv("LLM_MODEL_TICKER", "claude-haiku-4-5")
+
+
+def _default_macro_model() -> str:
+    import os
+    return os.getenv("LLM_MODEL_MACRO", "claude-sonnet-4-6")
+
+
 def research_ticker(
     llm: LLMClient,
     ticker: str,
     df: Optional[pd.DataFrame],
     snap: Optional[MarketSnapshot] = None,
     *,
-    model: str = "claude-sonnet-4-6",
+    model: Optional[str] = None,
     max_searches: int = 5,
+    user_id: Optional[int] = None,
+    use_cache: bool = True,
 ) -> Optional[ResearchResult]:
     """
     /why TICKER — 특정 종목이 왜 움직이는지 해설.
     df: 일봉 OHLCV (최근 1-3개월). None 가능 (가격 컨텍스트 없이도 동작).
     """
+    cache_key = _ticker_cache_key(ticker)
+    if use_cache:
+        cached = _try_cache_get("why_ticker", cache_key)
+        if cached is not None:
+            log.info(f"[OnDemand] cache hit: why_ticker {cache_key}")
+            return cached
+
     pos_info = _position_summary(ticker)
     ctx = _ticker_context(ticker, df, pos_info, snap)
+    effective_model = model or _default_ticker_model()
 
     user = (
         f"{ticker} 종목이 최근 왜 움직이고 있는지 해설해주세요.\n\n"
@@ -198,13 +285,14 @@ def research_ticker(
 
     try:
         text, citations, usage = llm.call_with_web_search(
-            model=model,
+            model=effective_model,
             system=_SYSTEM_TICKER,
             user=user,
             max_tokens=1200,
             max_searches=max_searches,
             purpose="why_ticker",
             ticker=ticker,
+            user_id=user_id,
         )
     except BudgetExceeded as e:
         log.warning(f"[OnDemand] 예산 초과: {e}")
@@ -216,23 +304,36 @@ def research_ticker(
     text = text.strip()
     if not text:
         return None
-    return ResearchResult(
+    result = ResearchResult(
         title=f"{ticker} — 왜 움직이는가",
         text=text,
         citations=citations,
         cost_usd=usage.cost_usd(),
     )
+    if use_cache:
+        _cache_put("why_ticker", cache_key, result, _CACHE_TTL_TICKER_SEC)
+    return result
 
 
 def research_macro_now(
     llm: LLMClient,
     snap: MarketSnapshot,
     *,
-    model: str = "claude-sonnet-4-6",
+    model: Optional[str] = None,
     max_searches: int = 5,
+    user_id: Optional[int] = None,
+    use_cache: bool = True,
 ) -> Optional[ResearchResult]:
     """/why (인자 없음) — 현재 시장 상황 해설."""
+    cache_key = _macro_cache_key()
+    if use_cache:
+        cached = _try_cache_get("why_macro", cache_key)
+        if cached is not None:
+            log.info(f"[OnDemand] cache hit: why_macro {cache_key}")
+            return cached
+
     ctx = _macro_context(snap)
+    effective_model = model or _default_macro_model()
     user = (
         "지금 시장 상황을 해설해주세요. 다음 24-48시간 시계.\n\n"
         f"현재 스냅샷:\n{ctx}\n\n"
@@ -242,12 +343,13 @@ def research_macro_now(
 
     try:
         text, citations, usage = llm.call_with_web_search(
-            model=model,
+            model=effective_model,
             system=_SYSTEM_MACRO_NOW,
             user=user,
             max_tokens=1200,
             max_searches=max_searches,
             purpose="why_macro",
+            user_id=user_id,
         )
     except BudgetExceeded as e:
         log.warning(f"[OnDemand] 예산 초과: {e}")
@@ -259,12 +361,15 @@ def research_macro_now(
     text = text.strip()
     if not text:
         return None
-    return ResearchResult(
+    result = ResearchResult(
         title="현재 시장 상황",
         text=text,
         citations=citations,
         cost_usd=usage.cost_usd(),
     )
+    if use_cache:
+        _cache_put("why_macro", cache_key, result, _CACHE_TTL_MACRO_SEC)
+    return result
 
 
 # ──────────────────────────────────────────────

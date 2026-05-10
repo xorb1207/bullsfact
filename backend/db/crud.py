@@ -7,7 +7,10 @@ from typing import Optional, Sequence
 from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 
-from .models import Watchlist, AlertLog, BacktestResult, LLMCallLog, ThresholdAlert, Position, EventCalibration, SellReminder
+from .models import (
+    Watchlist, AlertLog, BacktestResult, LLMCallLog, ThresholdAlert,
+    Position, EventCalibration, SellReminder, LLMCache, User,
+)
 
 
 # ──────────────────────────────────────────────
@@ -508,6 +511,175 @@ def list_event_calibrations(db: Session) -> Sequence[EventCalibration]:
 
 
 # ──────────────────────────────────────────────
+# LLMCache
+# ──────────────────────────────────────────────
+
+def get_llm_cache(db: Session, *, purpose: str, cache_key: str) -> Optional[LLMCache]:
+    """만료 안 된 캐시만 반환."""
+    now = datetime.utcnow()
+    return db.execute(
+        select(LLMCache).where(
+            LLMCache.purpose == purpose,
+            LLMCache.cache_key == cache_key,
+            LLMCache.expires_at > now,
+        ).order_by(LLMCache.created_at.desc()).limit(1)
+    ).scalar_one_or_none()
+
+
+def put_llm_cache(
+    db: Session,
+    *,
+    purpose: str,
+    cache_key: str,
+    result_text: dict,
+    cost_usd: float,
+    ttl_seconds: int,
+) -> LLMCache:
+    from datetime import timedelta
+    now = datetime.utcnow()
+    row = LLMCache(
+        purpose=purpose,
+        cache_key=cache_key,
+        result_text=result_text,
+        cost_usd=cost_usd,
+        created_at=now,
+        expires_at=now + timedelta(seconds=ttl_seconds),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def cleanup_expired_cache(db: Session) -> int:
+    now = datetime.utcnow()
+    rows = db.execute(
+        select(LLMCache).where(LLMCache.expires_at <= now)
+    ).scalars().all()
+    n = len(rows)
+    for r in rows:
+        db.delete(r)
+    if n:
+        db.commit()
+    return n
+
+
+def cache_stats(db: Session, *, since_days: int = 30) -> dict:
+    """캐시 hit 통계 — /cost 출력용. cost_usd 합 = 절감 추정."""
+    from datetime import timedelta
+    from sqlalchemy import func
+    since = datetime.utcnow() - timedelta(days=since_days)
+    row = db.execute(
+        select(
+            func.count(LLMCache.id).label("entries"),
+            func.coalesce(func.sum(LLMCache.cost_usd), 0.0).label("savings_potential"),
+        ).where(LLMCache.created_at >= since)
+    ).one()
+    return {
+        "entries": int(row.entries or 0),
+        "savings_potential_usd": float(row.savings_potential or 0.0),
+    }
+
+
+# ──────────────────────────────────────────────
+# User
+# ──────────────────────────────────────────────
+
+# tier 별 default 일일 캡 (USD)
+TIER_DEFAULT_CAP = {
+    "OWNER":   None,         # None = env MAX_DAILY_LLM_USD 사용
+    "TRUSTED": 0.30,
+    "LIMITED": 0.10,
+}
+
+
+def get_user_by_chat_id(db: Session, chat_id: str) -> Optional[User]:
+    return db.execute(
+        select(User).where(User.telegram_chat_id == str(chat_id))
+    ).scalar_one_or_none()
+
+
+def get_or_create_owner(db: Session, chat_id: str, name: Optional[str] = None) -> User:
+    """env TELEGRAM_CHAT_ID 와 매칭되는 사용자를 OWNER로 자동 생성/보장."""
+    existing = get_user_by_chat_id(db, chat_id)
+    if existing:
+        if existing.tier != "OWNER":
+            existing.tier = "OWNER"
+            db.commit()
+            db.refresh(existing)
+        return existing
+    user = User(
+        telegram_chat_id=str(chat_id),
+        name=name or "Owner",
+        tier="OWNER",
+        active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def list_users(db: Session, *, active_only: bool = True) -> Sequence[User]:
+    stmt = select(User)
+    if active_only:
+        stmt = stmt.where(User.active.is_(True))
+    return db.execute(stmt).scalars().all()
+
+
+def upsert_user(
+    db: Session,
+    *,
+    telegram_chat_id: str,
+    tier: str = "LIMITED",
+    name: Optional[str] = None,
+    llm_daily_cap_usd: Optional[float] = None,
+) -> User:
+    existing = get_user_by_chat_id(db, telegram_chat_id)
+    if existing:
+        existing.tier = tier
+        if name is not None:
+            existing.name = name
+        if llm_daily_cap_usd is not None:
+            existing.llm_daily_cap_usd = llm_daily_cap_usd
+        db.commit()
+        db.refresh(existing)
+        return existing
+    user = User(
+        telegram_chat_id=str(telegram_chat_id),
+        name=name,
+        tier=tier,
+        llm_daily_cap_usd=llm_daily_cap_usd,
+        active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def user_llm_spent_today(db: Session, user_id: int) -> float:
+    """오늘 (UTC 자정 이후) 누적 LLM 비용 (USD)."""
+    from sqlalchemy import func
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    row = db.execute(
+        select(func.coalesce(func.sum(LLMCallLog.cost_cents), 0.0))
+        .where(LLMCallLog.user_id == user_id, LLMCallLog.called_at >= today_start)
+    ).scalar_one()
+    return float(row or 0.0) / 100.0
+
+
+def effective_daily_cap(user: User, env_cap: float) -> float:
+    """사용자 tier + 개별 override 기반 일일 캡."""
+    if user.llm_daily_cap_usd is not None:
+        return float(user.llm_daily_cap_usd)
+    default = TIER_DEFAULT_CAP.get(user.tier)
+    if default is None:
+        return env_cap
+    return float(default)
+
+
+# ──────────────────────────────────────────────
 # LLMCallLog
 # ──────────────────────────────────────────────
 
@@ -523,11 +695,13 @@ def insert_llm_call(
     cache_creation_tokens: int,
     cost_cents: float,
     latency_ms: Optional[int] = None,
+    user_id: Optional[int] = None,
 ) -> LLMCallLog:
     row = LLMCallLog(
         model=model,
         purpose=purpose,
         ticker=ticker,
+        user_id=user_id,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,

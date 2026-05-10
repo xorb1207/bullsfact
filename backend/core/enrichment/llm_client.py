@@ -32,6 +32,7 @@ class CallUsage:
     cache_creation_tokens: int = 0
     purpose: str = ""              # "synthesizer" | "analyst:news" | ...
     ticker: Optional[str] = None
+    user_id: Optional[int] = None  # 멀티유저 비용 추적
     latency_ms: Optional[int] = None
 
     def cost_usd(self) -> float:
@@ -59,10 +60,19 @@ class LLMClient:
         api_key: Optional[str] = None,
         max_daily_usd: float = 2.0,
         on_call: Optional[Callable[[CallUsage], None]] = None,
+        user_cap_resolver: Optional[Callable[[int], float]] = None,
+        user_spent_resolver: Optional[Callable[[int], float]] = None,
     ):
+        """
+        user_cap_resolver(user_id) → 해당 사용자 일일 캡 (USD).
+        user_spent_resolver(user_id) → 해당 사용자 오늘 누적 (USD).
+        둘 다 미지정 시 글로벌 max_daily_usd 만 적용.
+        """
         self._api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
         self._max_daily_usd = max_daily_usd
         self._on_call = on_call
+        self._user_cap_resolver = user_cap_resolver
+        self._user_spent_resolver = user_spent_resolver
         self._lock = threading.Lock()
         self._spent_today_usd: float = 0.0
         self._spent_date: date = date.today()
@@ -76,7 +86,7 @@ class LLMClient:
             self._client = Anthropic(api_key=self._api_key)
         return self._client
 
-    def _check_and_reset_budget(self) -> None:
+    def _check_and_reset_budget(self, user_id: Optional[int] = None) -> None:
         with self._lock:
             today = date.today()
             if today != self._spent_date:
@@ -84,8 +94,21 @@ class LLMClient:
                 self._spent_today_usd = 0.0
             if self._spent_today_usd >= self._max_daily_usd:
                 raise BudgetExceeded(
-                    f"일일 LLM 비용 캡 ${self._max_daily_usd:.2f} 초과 "
+                    f"일일 LLM 비용 캡(global) ${self._max_daily_usd:.2f} 초과 "
                     f"(오늘 누적 ${self._spent_today_usd:.4f})"
+                )
+
+        # 사용자별 캡 (있을 때만)
+        if user_id is not None and self._user_cap_resolver and self._user_spent_resolver:
+            try:
+                cap = self._user_cap_resolver(user_id)
+                spent = self._user_spent_resolver(user_id)
+            except Exception as e:
+                log.warning(f"[LLM] user cap resolver 실패 (무시): {e}")
+                return
+            if spent >= cap:
+                raise BudgetExceeded(
+                    f"사용자(#{user_id}) 일일 캡 ${cap:.2f} 초과 (오늘 ${spent:.4f})"
                 )
 
     def _record_spend(self, usage: CallUsage) -> None:
@@ -109,9 +132,10 @@ class LLMClient:
         cache_system: bool = True,
         purpose: str = "",
         ticker: Optional[str] = None,
+        user_id: Optional[int] = None,
     ) -> tuple[str, CallUsage]:
         """단일 메시지 호출. (text, usage) 반환."""
-        self._check_and_reset_budget()
+        self._check_and_reset_budget(user_id=user_id)
         client = self._ensure_client()
 
         system_blocks = [{"type": "text", "text": system}]
@@ -136,6 +160,7 @@ class LLMClient:
             cache_creation_tokens=getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
             purpose=purpose,
             ticker=ticker,
+            user_id=user_id,
             latency_ms=latency_ms,
         )
         self._record_spend(usage)
@@ -156,6 +181,7 @@ class LLMClient:
         max_searches: int = 5,
         purpose: str = "",
         ticker: Optional[str] = None,
+        user_id: Optional[int] = None,
     ) -> tuple[str, list[str], CallUsage]:
         """
         web_search 서버 툴을 켠 호출. Anthropic이 자동으로 검색 실행, 결과를 본문에 통합.
@@ -164,7 +190,7 @@ class LLMClient:
         주의: web_search는 토큰 외 검색 비용 별도 ($10/1k searches @ 2026-05).
               여기서는 일반 토큰 비용만 추적 — 검색 비용은 캡 외에 발생함을 인지할 것.
         """
-        self._check_and_reset_budget()
+        self._check_and_reset_budget(user_id=user_id)
         client = self._ensure_client()
 
         t0 = time.monotonic()
@@ -200,6 +226,7 @@ class LLMClient:
             cache_creation_tokens=getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
             purpose=purpose,
             ticker=ticker,
+            user_id=user_id,
             latency_ms=latency_ms,
         )
         self._record_spend(usage)

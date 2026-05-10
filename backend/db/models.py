@@ -163,6 +163,50 @@ class EventCalibration(Base):
 Index("ix_event_calibration_event_ticker", EventCalibration.event_type, EventCalibration.ticker)
 
 
+class LLMCache(Base):
+    """
+    LLM 결과 캐시 — 동일 (purpose, key)에 대한 반복 호출 방지.
+
+    매크로 해설 등 사용자 무관 결과는 1번 호출 → N명에게 같은 본문.
+    /why TICKER 는 시간 윈도 단위 캐싱 (30분).
+
+    expires_at 지나면 만료 (재호출). cleanup은 별도 배치 (선택).
+    """
+    __tablename__ = "llm_cache"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    purpose = Column(String(32), nullable=False, index=True)   # "macro_briefing" | "why_ticker" | "why_macro" | ...
+    cache_key = Column(String(256), nullable=False, index=True)
+    result_text = Column(JSON, nullable=False)                 # {"text": ..., "citations": [...]}
+    cost_usd = Column(Float, nullable=False)                   # 원래 호출 비용 (절감액 추적용)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False, index=True)
+
+
+Index("ix_llm_cache_purpose_key", LLMCache.purpose, LLMCache.cache_key)
+
+
+class User(Base):
+    """
+    멀티유저 진입 골격 — telegram_chat_id 기반 식별.
+    단일 사용자 모드 시 첫 호출에 OWNER 자동 생성.
+
+    tier:
+      - OWNER:   본인. 일일 캡 대 (env MAX_DAILY_LLM_USD).
+      - TRUSTED: 가족 핵심. 일일 캡 중 ($0.30 default).
+      - LIMITED: 지인. 일일 캡 소 ($0.10 default).
+    """
+    __tablename__ = "user"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_chat_id = Column(String(64), nullable=False, unique=True, index=True)
+    name = Column(String(64), nullable=True)
+    tier = Column(String(16), nullable=False, default="LIMITED")
+    llm_daily_cap_usd = Column(Float, nullable=True)           # tier default override
+    active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 class LLMCallLog(Base):
     """Synthesizer/Analyst의 LLM 호출 기록. 일일 비용 리포트에서 집계."""
     __tablename__ = "llm_call_log"
@@ -171,6 +215,7 @@ class LLMCallLog(Base):
     model = Column(String(64), nullable=False)
     purpose = Column(String(32), nullable=False)             # "synthesizer" | "analyst:news" | ...
     ticker = Column(String(32), nullable=True, index=True)
+    user_id = Column(Integer, nullable=True, index=True)     # User.id (멀티유저 비용 추적)
     input_tokens = Column(Integer, nullable=False)
     output_tokens = Column(Integer, nullable=False)
     cache_read_tokens = Column(Integer, nullable=False, default=0)

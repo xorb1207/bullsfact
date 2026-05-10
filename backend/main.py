@@ -62,6 +62,7 @@ def _persist_llm_call(usage) -> None:
             model=usage.model,
             purpose=usage.purpose or "unknown",
             ticker=usage.ticker,
+            user_id=usage.user_id,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cache_read_tokens=usage.cache_read_tokens,
@@ -97,7 +98,10 @@ def build_pipeline() -> Pipeline:
     )
     enricher = LLMEnricher(
         analysts=[NewsAnalyst(), FundamentalsAnalyst()],
-        synthesizer=Synthesizer(llm=llm, model="claude-sonnet-4-6"),
+        synthesizer=Synthesizer(
+            llm=llm,
+            model=os.getenv("LLM_MODEL_ENRICHMENT", "claude-haiku-4-5"),
+        ),
         timeout_sec=30.0,
     )
 

@@ -50,6 +50,13 @@ def _run_lightweight_migrations() -> None:
                 if col_name not in cols:
                     conn.execute(text(f"ALTER TABLE alert_log ADD COLUMN {col_name} FLOAT"))
 
+    # llm_call_log.user_id 추가 (멀티유저 비용 추적)
+    if "llm_call_log" in existing_tables:
+        cols = {c["name"] for c in inspector.get_columns("llm_call_log")}
+        if "user_id" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE llm_call_log ADD COLUMN user_id INTEGER"))
+
 
 def get_db():
     """FastAPI Depends용 세션 제너레이터."""

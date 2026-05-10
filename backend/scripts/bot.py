@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 load_dotenv("backend/.env", override=True)
 
 from backend.db import SessionLocal, init_db, crud
+from backend.db.models import User
 from backend.core.datasource import DataProvider
 from backend.core.strategy import DipBuyStrategy
 from backend.core.strategy.dip_buy import Signal, SignalStrength
@@ -106,6 +107,7 @@ def _persist_llm_call(usage) -> None:
             model=usage.model,
             purpose=usage.purpose or "unknown",
             ticker=usage.ticker,
+            user_id=usage.user_id,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cache_read_tokens=usage.cache_read_tokens,
@@ -387,17 +389,44 @@ def cmd_cost(args: list[str], ctx: BotContext) -> str:
         wk = crud.llm_cost_summary(db, since=wk_start)
 
         alerts = _alert_summary_today(db)
-        cap = float(os.getenv("MAX_DAILY_LLM_USD", "2.0"))
-        today_pct = today["cost_usd"] / cap * 100 if cap else 0
-        body = (
-            "<b>💰 bullsfact 비용 리포트</b>\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            f"<b>오늘</b>: ${today['cost_usd']:.4f} / 캡 ${cap:.2f} ({today_pct:.1f}%)\n"
-            f"  LLM {today['calls']}회, "
-            f"알람 STRONG {alerts['strong']} / WEAK {alerts['weak']}\n\n"
-            f"<b>어제</b>: ${yest['cost_usd']:.4f} ({yest['calls']}회)\n"
-            f"<b>최근 7일</b>: ${wk['cost_usd']:.4f} ({wk['calls']}회)"
+        env_cap = float(os.getenv("MAX_DAILY_LLM_USD", "2.0"))
+        today_pct = today["cost_usd"] / env_cap * 100 if env_cap else 0
+
+        # 사용자별 사용량 (간략)
+        users = crud.list_users(db, active_only=True)
+        user_lines = []
+        for u in users:
+            spent = crud.user_llm_spent_today(db, u.id)
+            cap = crud.effective_daily_cap(u, env_cap)
+            pct = (spent / cap * 100) if cap else 0
+            label = u.name or f"#{u.id}"
+            user_lines.append(
+                f"  {u.tier:8s} {_esc(label)} ${spent:.4f} / ${cap:.2f} ({pct:.0f}%)"
+            )
+
+        # 캐시 통계
+        cstats = crud.cache_stats(db, since_days=30)
+
+        body_parts = [
+            "<b>💰 bullsfact 비용 리포트</b>",
+            "━━━━━━━━━━━━━━━━━",
+            f"<b>오늘 (전체)</b>: ${today['cost_usd']:.4f} / 글로벌 캡 ${env_cap:.2f} ({today_pct:.1f}%)",
+            f"  LLM {today['calls']}회, 알람 STRONG {alerts['strong']} / WEAK {alerts['weak']}",
+            "",
+            f"<b>어제</b>: ${yest['cost_usd']:.4f} ({yest['calls']}회)",
+            f"<b>최근 7일</b>: ${wk['cost_usd']:.4f} ({wk['calls']}회)",
+        ]
+        if user_lines:
+            body_parts.append("")
+            body_parts.append("<b>👥 사용자별 (오늘)</b>")
+            body_parts.extend(user_lines)
+        body_parts.append("")
+        body_parts.append(
+            f"<b>📦 LLM 캐시</b> (최근 30일): "
+            f"항목 {cstats['entries']}건, "
+            f"절감 추정 ${cstats['savings_potential_usd']:.2f}"
         )
+        body = "\n".join(body_parts)
     finally:
         db.close()
 
@@ -1036,6 +1065,16 @@ def cmd_exposure(args: list[str], ctx: BotContext) -> str:
 # /why — 매크로/티커 해설 (LLM + web_search, on-demand)
 # ──────────────────────────────────────────────
 
+def _resolve_user_id(ctx: BotContext) -> Optional[int]:
+    """현재 ctx.allowed_chat_id 의 User.id 조회. 없으면 None."""
+    db = SessionLocal()
+    try:
+        u = crud.get_user_by_chat_id(db, ctx.allowed_chat_id)
+        return u.id if u else None
+    finally:
+        db.close()
+
+
 def cmd_why(args: list[str], ctx: BotContext) -> str:
     """
     /why            → 현재 시장 매크로 해설
@@ -1045,35 +1084,35 @@ def cmd_why(args: list[str], ctx: BotContext) -> str:
         return ("⚠️ LLM 비활성 (ANTHROPIC_API_KEY 없음).\n"
                 "<code>backend/.env</code> 에 키 추가 후 봇 재시작.")
 
+    user_id = _resolve_user_id(ctx)
+
     # 인자 없음 → 매크로 해설
     if not args:
         snap = ctx.market.fetch()
-        result = research_macro_now(ctx.llm, snap)
+        result = research_macro_now(ctx.llm, snap, user_id=user_id)
         if not result:
-            return "⚠️ 해설 생성 실패 (API 과부하 또는 예산 초과). <code>/cost</code> 확인"
+            return "⚠️ 해설 생성 실패 (한도 초과 또는 API 과부하). <code>/cost</code> 확인"
         return format_research(result)
 
     # /why TICKER
     ticker_raw = args[0].strip()
     ticker = ticker_raw.upper() if ("/" not in ticker_raw and "-" not in ticker_raw) else ticker_raw
 
-    # 일봉 OHLCV (최대 1년) — fetch 실패해도 LLM은 돌림
     df = None
     try:
         df = ctx.provider.get_ohlcv(ticker, interval="1d", period="1y")
     except Exception as e:
         log.warning(f"/why {ticker} OHLCV fetch 실패: {type(e).__name__}: {e}")
 
-    # 매크로 스냅샷도 컨텍스트로 (실패해도 진행)
     snap = None
     try:
         snap = ctx.market.fetch()
     except Exception as e:
         log.warning(f"/why {ticker} market snap 실패: {type(e).__name__}: {e}")
 
-    result = research_ticker(ctx.llm, ticker, df, snap)
+    result = research_ticker(ctx.llm, ticker, df, snap, user_id=user_id)
     if not result:
-        return f"⚠️ {_esc(ticker)} 해설 생성 실패 (API 과부하 또는 예산 초과)"
+        return f"⚠️ {_esc(ticker)} 해설 생성 실패 (한도 초과 또는 API 과부하)"
     return format_research(result)
 
 
@@ -1481,14 +1520,47 @@ def main() -> None:
     # M1: 이벤트 캘린더 (FINNHUB/FRED/DART 키 없으면 자동 silent skip)
     calendar = CalendarFetcher()
 
+    # OWNER 사용자 자동 보장 (멀티유저 진입 골격)
+    try:
+        db = SessionLocal()
+        try:
+            owner = crud.get_or_create_owner(db, chat_id=chat_id, name="Owner")
+            log.info(f"User OWNER 보장: #{owner.id} (chat_id={chat_id})")
+        finally:
+            db.close()
+    except Exception as e:
+        log.error(f"User OWNER 생성 실패 (무시): {type(e).__name__}: {e}")
+
+    # 사용자별 캡 resolver — chat_id 기반으로 user 조회
+    env_cap = float(os.getenv("MAX_DAILY_LLM_USD", "2.0"))
+
+    def _user_cap(user_id: int) -> float:
+        db = SessionLocal()
+        try:
+            user = db.get(User, user_id)
+            if user is None:
+                return env_cap
+            return crud.effective_daily_cap(user, env_cap)
+        finally:
+            db.close()
+
+    def _user_spent(user_id: int) -> float:
+        db = SessionLocal()
+        try:
+            return crud.user_llm_spent_today(db, user_id)
+        finally:
+            db.close()
+
     # LLMClient — 매크로 해설 / on-demand 분석용. ANTHROPIC_API_KEY 없으면 None.
     llm: Optional[LLMClient] = None
     if os.getenv("ANTHROPIC_API_KEY"):
         llm = LLMClient(
-            max_daily_usd=float(os.getenv("MAX_DAILY_LLM_USD", "2.0")),
+            max_daily_usd=env_cap,
             on_call=_persist_llm_call,
+            user_cap_resolver=_user_cap,
+            user_spent_resolver=_user_spent,
         )
-        log.info("LLMClient 활성 — 매크로 해설/on-demand 사용 가능")
+        log.info("LLMClient 활성 — 매크로 해설/on-demand 사용 가능 (per-user cap 활성)")
     else:
         log.info("ANTHROPIC_API_KEY 없음 — 매크로 해설 비활성")
 

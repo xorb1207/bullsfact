@@ -11,8 +11,20 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+from datetime import datetime, timezone, timedelta
+
 from .enrichment.llm_client import LLMClient, BudgetExceeded
 from .market import MarketSnapshot
+from backend.db import SessionLocal, crud
+
+
+_CACHE_TTL_BRIEFING_SEC = 24 * 60 * 60     # 24h
+
+
+def _briefing_cache_key() -> str:
+    """KST 기준 날짜 단위 — 같은 날 N명 사용자에게 같은 본문."""
+    kst = datetime.now(timezone.utc) + timedelta(hours=9)
+    return kst.strftime("%Y-%m-%d")
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +37,9 @@ class MacroBriefing:
 
 
 _SYSTEM = """You are a macro market analyst writing for a Korean retail investor focused on AI/semiconductor stocks.
+
+CRITICAL: Output ONLY the final answer. No meta-commentary, no thinking aloud.
+Start IMMEDIATELY with "<b>핵심 움직임</b>" — no preamble.
 
 Output rules:
 - Korean, very concise. Total under 800 characters of body text.
@@ -82,22 +97,50 @@ def _format_snapshot_context(snap: MarketSnapshot) -> str:
     return "\n\n".join(parts)
 
 
+def _default_briefing_model() -> str:
+    import os
+    return os.getenv("LLM_MODEL_BRIEFING", "claude-sonnet-4-6")
+
+
 def generate_daily_recap(
     llm: LLMClient,
     snap: MarketSnapshot,
     *,
-    model: str = "claude-sonnet-4-6",
+    model: Optional[str] = None,
     max_searches: int = 5,
+    user_id: Optional[int] = None,
+    use_cache: bool = True,
 ) -> Optional[MacroBriefing]:
     """
     일일 매크로 해설 생성. 실패는 None.
 
     실제 검색 비용 (~$0.05/call @ 5 searches) + LLM 토큰 비용 발생.
+    하루 1번 호출 → 캐시 24h. 멀티유저 시 같은 날 N명에게 같은 본문 발송 → 비용 ÷N.
     """
     if not llm:
         return None
 
+    cache_key = _briefing_cache_key()
+    if use_cache:
+        try:
+            db = SessionLocal()
+            try:
+                row = crud.get_llm_cache(db, purpose="macro_briefing", cache_key=cache_key)
+                if row:
+                    log.info(f"[MacroBriefing] cache hit: {cache_key}")
+                    data = row.result_text or {}
+                    return MacroBriefing(
+                        text=data.get("text", ""),
+                        citations=data.get("citations", []) or [],
+                        cost_usd=0.0,
+                    )
+            finally:
+                db.close()
+        except Exception as e:
+            log.debug(f"[MacroBriefing] cache get 실패 (무시): {type(e).__name__}: {e}")
+
     snapshot_text = _format_snapshot_context(snap)
+    effective_model = model or _default_briefing_model()
     user = (
         "어제~오늘 미국 증시 주요 움직임을 해설해주세요.\n"
         "현재 시장 스냅샷 (보조 컨텍스트):\n"
@@ -108,12 +151,13 @@ def generate_daily_recap(
 
     try:
         text, citations, usage = llm.call_with_web_search(
-            model=model,
+            model=effective_model,
             system=_SYSTEM,
             user=user,
             max_tokens=1500,
             max_searches=max_searches,
             purpose="macro_briefing",
+            user_id=user_id,
         )
     except BudgetExceeded as e:
         log.warning(f"[MacroBriefing] 예산 초과 — 스킵: {e}")
@@ -127,7 +171,24 @@ def generate_daily_recap(
         log.warning("[MacroBriefing] 빈 응답")
         return None
 
-    return MacroBriefing(text=text, citations=citations, cost_usd=usage.cost_usd())
+    result = MacroBriefing(text=text, citations=citations, cost_usd=usage.cost_usd())
+
+    if use_cache:
+        try:
+            db = SessionLocal()
+            try:
+                crud.put_llm_cache(
+                    db, purpose="macro_briefing", cache_key=cache_key,
+                    result_text={"text": text, "citations": citations},
+                    cost_usd=usage.cost_usd(),
+                    ttl_seconds=_CACHE_TTL_BRIEFING_SEC,
+                )
+            finally:
+                db.close()
+        except Exception as e:
+            log.debug(f"[MacroBriefing] cache put 실패 (무시): {type(e).__name__}: {e}")
+
+    return result
 
 
 def format_for_telegram(briefing: MacroBriefing, max_citations: int = 5) -> str:
