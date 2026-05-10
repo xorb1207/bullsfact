@@ -8,6 +8,9 @@ Freqtrade의 DataProvider 패턴 참고.
   SOXL, TQQQ, NVDA   →  yfinance (미국 주식/ETF)
 """
 import logging
+import threading
+import time
+
 import pandas as pd
 
 from .base import DataSource
@@ -18,6 +21,10 @@ log = logging.getLogger(__name__)
 
 # 슬래시 포함 + 이 quote currency 목록이면 Binance로 라우팅
 _BINANCE_QUOTES = {"USDT", "BUSD", "BTC", "ETH", "BNB", "USDC"}
+
+# OHLCV 캐시 TTL — Telegram 명령 반복 호출 시 즉답.
+# 스캐너(15분 주기)는 영향 없음. 사용자 체감용.
+_OHLCV_CACHE_TTL_SEC = 60
 
 
 def _is_binance_pair(ticker: str) -> bool:
@@ -41,6 +48,9 @@ class DataProvider:
     ):
         self._yf = YFinanceSource()
         self._binance = BinanceSource(binance_api_key, binance_api_secret)
+        # OHLCV 캐시 — (ticker, interval, period) → (timestamp, df)
+        self._cache: dict[tuple, tuple[float, pd.DataFrame]] = {}
+        self._cache_lock = threading.Lock()
 
     def _route(self, ticker: str) -> DataSource:
         source = self._binance if _is_binance_pair(ticker) else self._yf
@@ -52,8 +62,26 @@ class DataProvider:
         ticker: str,
         interval: str = "1h",
         period: str = "60d",
+        use_cache: bool = True,
     ) -> pd.DataFrame:
-        return self._route(ticker).get_ohlcv(ticker, interval, period)
+        """
+        TTL 캐시 (60초) 적용. 같은 (ticker, interval, period) 반복 호출 시 즉답.
+        use_cache=False 로 강제 우회 가능 (백테스트, 캘리브레이션 등).
+        """
+        key = (ticker, interval, period)
+        now = time.time()
+        if use_cache:
+            with self._cache_lock:
+                hit = self._cache.get(key)
+                if hit is not None and (now - hit[0]) < _OHLCV_CACHE_TTL_SEC:
+                    return hit[1]
+
+        df = self._route(ticker).get_ohlcv(ticker, interval, period)
+
+        if use_cache and df is not None and not df.empty:
+            with self._cache_lock:
+                self._cache[key] = (now, df)
+        return df
 
     def get_price(self, ticker: str) -> float:
         return self._route(ticker).get_price(ticker)

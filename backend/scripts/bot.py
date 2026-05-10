@@ -194,59 +194,77 @@ def cmd_list(args: list[str], ctx: BotContext) -> str:
     user_id = _resolve_user_id(ctx)
     db = SessionLocal()
     try:
-        items = crud.list_watchlist(db, active_only=False, user_id=user_id)
+        items = list(crud.list_watchlist(db, active_only=False, user_id=user_id))
     finally:
         db.close()
 
     if not items:
         return "워치리스트 비어있음. <code>/add TICKER</code> 로 추가."
 
-    # 스캐너와 동일 interval/period 사용 — RSI 일관성 확보
     interval = os.getenv("DATA_INTERVAL", "1d")
-    period = os.getenv("DATA_PERIOD", "2y")
+    # /list 는 RSI 14 + BB 20 + 일일 변동률만 필요 — 60일이면 충분
+    period = "60d"
+
+    # 활성 종목 병렬 fetch + 신호 계산
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _evaluate(w):
+        try:
+            df = ctx.provider.get_ohlcv(w.ticker, interval=interval, period=period)
+            sig = ctx.strategy.generate_signal(df, w.ticker)
+            close = df["close"] if df is not None and "close" in df.columns else None
+            change_pct = None
+            if close is not None and len(close) >= 2:
+                prev = float(close.iloc[-2])
+                cur = float(close.iloc[-1])
+                if prev:
+                    change_pct = (cur - prev) / prev * 100
+            cal_suffix = _ticker_calendar_suffix(ctx, w.ticker)
+            return (w, sig, change_pct, cal_suffix, None)
+        except Exception as e:
+            return (w, None, None, None, e)
+
+    active = [w for w in items if w.active]
+    inactive = [w for w in items if not w.active]
+
+    results: list = []
+    if active:
+        with ThreadPoolExecutor(max_workers=8, thread_name_prefix="list") as ex:
+            results = list(ex.map(_evaluate, active))
 
     rows = [
         "<b>워치리스트</b>  <i>⚪정상 · 🟡약신호 · 🔴강신호</i>",
         "━━━━━━━━━━━━━━━━━",
     ]
-    for w in items:
+
+    for w, sig, change_pct, cal_suffix, err in results:
         short_name = _short_company_name(w.name)
         name_str = f"  <i>{_esc(short_name)}</i>" if short_name else ""
-        if not w.active:
-            rows.append(f"⚪ {_esc(w.ticker)}{name_str} — 비활성")
+        if err is not None:
+            rows.append(f"⚠️ <b>{_esc(w.ticker)}</b>{name_str}: {_esc(type(err).__name__)}")
             continue
-        try:
-            df = ctx.provider.get_ohlcv(w.ticker, interval=interval, period=period)
-            sig = ctx.strategy.generate_signal(df, w.ticker)
-            rsi = sig.indicators.get("rsi")
-            rsi_str = f"{rsi:.1f}" if isinstance(rsi, float) and not math.isnan(rsi) else "N/A"
-            emoji = {"strong": "🔴", "weak": "🟡", "none": "⚪"}.get(sig.strength.value, "⚪")
-            price_str = format_money(sig.price, w.ticker)
+        rsi = sig.indicators.get("rsi") if sig else None
+        rsi_str = f"{rsi:.1f}" if isinstance(rsi, float) and not math.isnan(rsi) else "N/A"
+        emoji = {"strong": "🔴", "weak": "🟡", "none": "⚪"}.get(
+            sig.strength.value if sig else "none", "⚪"
+        )
+        price_str = format_money(sig.price if sig else 0.0, w.ticker)
+        change_str = f"{change_pct:+.2f}%" if change_pct is not None else ""
 
-            # 일일 변동률 (마지막 캔들 vs 그 직전)
-            close = df["close"]
-            if len(close) >= 2:
-                prev = float(close.iloc[-2])
-                cur = float(close.iloc[-1])
-                change_pct = (cur - prev) / prev * 100 if prev else 0.0
-                change_str = f"{change_pct:+.2f}%"
-            else:
-                change_str = ""
+        rows.append(f"{emoji} <b>{_esc(w.ticker)}</b>{name_str}")
+        metric_parts = [price_str]
+        if change_str:
+            metric_parts.append(change_str)
+        metric_parts.append(f"RSI {rsi_str}")
+        rows.append("   " + "  ·  ".join(metric_parts))
+        if cal_suffix:
+            rows.append(f"   {cal_suffix}")
 
-            # 2줄 구조 — 모바일 가독성
-            rows.append(f"{emoji} <b>{_esc(w.ticker)}</b>{name_str}")
-            metric_parts = [price_str]
-            if change_str:
-                metric_parts.append(change_str)
-            metric_parts.append(f"RSI {rsi_str}")
-            rows.append("   " + "  ·  ".join(metric_parts))
+    for w in inactive:
+        short_name = _short_company_name(w.name)
+        name_str = f"  <i>{_esc(short_name)}</i>" if short_name else ""
+        rows.append(f"⚪ {_esc(w.ticker)}{name_str} — 비활성")
 
-            # M1: 캘린더 suffix는 추가 라인
-            cal_suffix = _ticker_calendar_suffix(ctx, w.ticker)
-            if cal_suffix:
-                rows.append(f"   {cal_suffix}")
-        except Exception as e:
-            rows.append(f"⚠️ <b>{_esc(w.ticker)}</b>{name_str}: {_esc(type(e).__name__)}")
     return "\n".join(rows)
 
 
@@ -828,18 +846,38 @@ def _cmd_position_list(ctx: BotContext) -> str:
 
 
 def _format_position_list(rows, db, ctx: BotContext) -> str:
+    from concurrent.futures import ThreadPoolExecutor
+
     lines = [
         "<b>보유 포지션</b>  <i>🟢이익 · 🔴손실</i>",
         "━━━━━━━━━━━━━━━━━",
     ]
     totals: dict[str, dict] = {}  # cur → {"value": float, "pnl": float}
 
+    # 회사명 lookup — 한 번 모음 (사용자 무관 메타)
+    name_map: dict[str, str] = {}
     for p in rows:
+        wl = crud.get_any_watchlist_item(db, p.ticker)
+        if wl and wl.name:
+            name_map[p.ticker] = wl.name
+
+    # 현재가 병렬 fetch (provider 60s 캐시 + thread pool)
+    def _fetch_price(p):
         try:
             df = ctx.provider.get_ohlcv(p.ticker, interval="1d", period="5d")
-            cur = float(df["close"].iloc[-1])
+            return (p, float(df["close"].iloc[-1]), None)
         except Exception as e:
-            lines.append(f"⚠️ <b>{_esc(p.ticker)}</b>: {_esc(type(e).__name__)} (현재가 fetch 실패)")
+            return (p, None, e)
+
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="port") as ex:
+        results = list(ex.map(_fetch_price, list(rows)))
+
+    for p, cur, err in results:
+        if err is not None or cur is None:
+            lines.append(
+                f"⚠️ <b>{_esc(p.ticker)}</b>: "
+                f"{_esc(type(err).__name__) if err else 'fetch 실패'} (현재가 미확보)"
+            )
             continue
 
         ret = (cur / p.avg_cost) - 1.0 if p.avg_cost > 0 else 0.0
@@ -851,9 +889,7 @@ def _format_position_list(rows, db, ctx: BotContext) -> str:
         slot["value"] += value
         slot["pnl"] += pnl
 
-        # 회사명 (Watchlist 캐시 활용, short form)
-        wl = crud.get_watchlist_item(db, p.ticker)
-        short_name = _short_company_name(wl.name) if wl else ""
+        short_name = _short_company_name(name_map.get(p.ticker))
         name_str = f"  <i>{_esc(short_name)}</i>" if short_name else ""
 
         emoji = "🟢" if ret >= 0 else "🔴"
@@ -865,7 +901,6 @@ def _format_position_list(rows, db, ctx: BotContext) -> str:
         value_str = format_money(value, p.ticker)
         pnl_str = format_money_signed(pnl, p.ticker)
 
-        # 멀티라인 구조 — 모바일 가독성 통일
         lines.append(f"{emoji} <b>{_esc(p.ticker)}</b>{name_str}")
         lines.append(f"   <b>{ret*100:+.1f}%</b>  ·  {value_str} ({qty_str}주)  ·  손익 {pnl_str}")
         lines.append(f"   평단 {avg_str}  ·  현재 {price_str}  ·  {_esc(ms_str)}")
