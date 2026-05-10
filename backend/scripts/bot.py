@@ -30,6 +30,7 @@ load_dotenv("backend/.env", override=True)
 
 from backend.db import SessionLocal, init_db, crud
 from backend.db.models import User
+from backend.core import wizard
 from backend.core.datasource import DataProvider
 from backend.core.strategy import DipBuyStrategy
 from backend.core.strategy.dip_buy import Signal, SignalStrength
@@ -46,6 +47,7 @@ from backend.core.money import format_money, format_money_signed, currency_for
 from backend.core.datasource.calendar_fetcher import CalendarFetcher
 from backend.core.exposure import compute_exposure, PortfolioExposure
 from backend.core.reminders import get_due_reminders, format_section as format_reminders
+from backend.core.portfolio_parser import parse_free_form
 from backend.core.post_mortem import update_returns, compute_statistics, format_stats_section
 
 log = logging.getLogger("bot")
@@ -87,14 +89,34 @@ def _api(ctx: BotContext, method: str, **payload) -> dict:
     return resp.json()
 
 
-def send(ctx: BotContext, text: str, chat_id: str | None = None) -> None:
+def send(
+    ctx: BotContext,
+    text: str,
+    chat_id: str | None = None,
+    reply_markup: dict | None = None,
+) -> None:
     """
     명시적 chat_id 우선. 없으면 현재 요청자(ctx.current_chat_id), 그것도 없으면 OWNER.
-    명령 응답은 자연히 보낸 사람에게 가고, 스케줄러/알림은 chat_id 명시.
+    reply_markup: Telegram inline keyboard 등 (선택).
     """
     target = chat_id or getattr(ctx, "current_chat_id", None) or ctx.allowed_chat_id
-    _api(ctx, "sendMessage", chat_id=target, text=text, parse_mode="HTML",
-         disable_web_page_preview=True)
+    payload = {
+        "chat_id": target,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    _api(ctx, "sendMessage", **payload)
+
+
+def _kb_button(text: str, callback_data: str) -> dict:
+    return {"text": text, "callback_data": callback_data}
+
+
+def _inline_kb(rows: list[list[dict]]) -> dict:
+    return {"inline_keyboard": rows}
 
 
 # ──────────────────────────────────────────────
@@ -968,18 +990,294 @@ def _cmd_position_remove(args: list[str], ctx: BotContext) -> str:
     return f"🗑️ 포지션 삭제: <b>{_esc(ticker)}</b>" if ok else f"❌ 없음: <b>{_esc(ticker)}</b>"
 
 
+# ──────────────────────────────────────────────
+# Wizard / Callback 처리
+# ──────────────────────────────────────────────
+
+def _ack_callback(ctx: BotContext, callback_id: str, text: str = "") -> None:
+    """Telegram 인라인 키보드 클릭 응답 (로딩 스피너 제거)."""
+    payload = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+    _api(ctx, "answerCallbackQuery", **payload)
+
+
+def _process_callback(callback: dict, ctx: BotContext) -> None:
+    cb_id = callback.get("id", "")
+    data = callback.get("data", "")
+    msg = callback.get("message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id", ""))
+    if not chat_id or not data:
+        _ack_callback(ctx, cb_id)
+        return
+
+    # 인증
+    db = SessionLocal()
+    try:
+        user = crud.get_user_by_chat_id(db, chat_id)
+    finally:
+        db.close()
+    if user is None or not user.active:
+        _ack_callback(ctx, cb_id, text="등록되지 않은 사용자")
+        return
+
+    ctx.current_user = user
+    ctx.current_chat_id = chat_id
+    _ack_callback(ctx, cb_id)
+
+    # 라우팅 — "namespace:action[:arg]"
+    parts = data.split(":", 2)
+    ns = parts[0]
+    action = parts[1] if len(parts) > 1 else ""
+    arg = parts[2] if len(parts) > 2 else ""
+
+    if ns == "port":
+        _handle_portfolio_callback(action, arg, ctx, user)
+    else:
+        log.warning(f"unknown callback ns={ns} data={data}")
+
+
+def _handle_portfolio_callback(action: str, arg: str, ctx: BotContext, user: User) -> None:
+    chat_id = ctx.current_chat_id
+
+    if action == "list":
+        send(ctx, _cmd_position_list(ctx))
+        return
+    if action == "exposure":
+        send(ctx, _cmd_exposure_inner(ctx))
+        return
+    if action == "import":
+        send(ctx, _cmd_portfolio_import_help())
+        return
+    if action == "add":
+        # tier 권한 체크 (TRUSTED 이상)
+        if not _can_use(user.tier, "portfolio"):
+            send(ctx, "⚠️ 권한 없음")
+            return
+        wizard.start(chat_id, "portfolio_add", "ticker", user_id=user.id)
+        send(ctx, (
+            "<b>➕ 종목 추가</b> — 1/3\n"
+            "종목 코드는?\n"
+            "<i>예: SOXL, NVDA, 005930.KS, ETH/USDT</i>"
+        ))
+        return
+    if action == "update":
+        if not _can_use(user.tier, "portfolio"):
+            send(ctx, "⚠️ 권한 없음")
+            return
+        wizard.start(chat_id, "portfolio_update", "ticker", user_id=user.id)
+        send(ctx, (
+            "<b>✏️ 평단/수량 수정</b> — 1/3\n"
+            "수정할 종목 코드는?"
+        ))
+        return
+    if action == "delete":
+        if not _can_use(user.tier, "portfolio"):
+            send(ctx, "⚠️ 권한 없음")
+            return
+        _send_delete_menu(ctx, user)
+        return
+    if action == "del":
+        # arg = ticker
+        _confirm_delete(ctx, user, arg)
+        return
+    if action == "delconfirm":
+        ticker = arg
+        db = SessionLocal()
+        try:
+            ok = crud.delete_position(db, ticker, user_id=user.id)
+        finally:
+            db.close()
+        send(ctx, f"🗑 {ticker} 삭제 완료" if ok else f"❌ {ticker} 없음")
+        return
+    if action == "delcancel":
+        send(ctx, "❌ 취소됐습니다.")
+        return
+
+    send(ctx, f"⚠️ 알 수 없는 액션: {action}")
+
+
+def _send_delete_menu(ctx: BotContext, user: User) -> None:
+    db = SessionLocal()
+    try:
+        rows = crud.list_positions(db, user_id=user.id)
+    finally:
+        db.close()
+    if not rows:
+        send(ctx, "삭제할 포지션 없음")
+        return
+    buttons: list[list[dict]] = []
+    line: list[dict] = []
+    for p in rows:
+        line.append(_kb_button(f"{p.ticker} ({p.qty:g})", f"port:del:{p.ticker}"))
+        if len(line) == 2:
+            buttons.append(line)
+            line = []
+    if line:
+        buttons.append(line)
+    send(ctx, "<b>🗑 삭제할 종목 선택</b>", reply_markup=_inline_kb(buttons))
+
+
+def _confirm_delete(ctx: BotContext, user: User, ticker: str) -> None:
+    db = SessionLocal()
+    try:
+        p = crud.get_position(db, ticker, user_id=user.id)
+    finally:
+        db.close()
+    if not p:
+        send(ctx, f"❌ {ticker} 없음")
+        return
+    kb = _inline_kb([[
+        _kb_button("✅ 삭제", f"port:delconfirm:{ticker}"),
+        _kb_button("❌ 취소", "port:delcancel"),
+    ]])
+    send(ctx, (
+        f"<b>{_esc(ticker)}</b> 정말 삭제할까요?\n"
+        f"보유 {p.qty:g}주 @ ${p.avg_cost:.2f}"
+    ), reply_markup=kb)
+
+
+# ──────────────────────────────────────────────
+# Wizard 단계별 핸들러
+# ──────────────────────────────────────────────
+
+def _wizard_handle_text(text: str, ctx: BotContext, state) -> None:
+    """진행 중인 wizard 의 다음 입력 처리."""
+    flow = state.flow
+    chat_id = ctx.current_chat_id
+
+    if flow == "portfolio_add":
+        _handle_portfolio_add_step(text, ctx, state)
+        return
+    if flow == "portfolio_update":
+        _handle_portfolio_update_step(text, ctx, state)
+        return
+
+    # 알 수 없는 흐름 — 안전하게 종료
+    wizard.cancel(chat_id)
+    send(ctx, "⚠️ 알 수 없는 wizard. 취소됐습니다.")
+
+
+def _handle_portfolio_add_step(text: str, ctx: BotContext, state) -> None:
+    chat_id = ctx.current_chat_id
+    user = ctx.current_user
+
+    if state.step == "ticker":
+        ticker = text.strip().upper()
+        if not ticker or len(ticker) > 32:
+            send(ctx, "⚠️ 잘못된 종목 코드. 다시 입력해주세요.")
+            return
+        wizard.advance(chat_id, "qty", ticker=ticker)
+        send(ctx, f"<b>➕ 종목 추가 — 2/3</b>\n<b>{_esc(ticker)}</b> 보유 수량은?")
+        return
+
+    if state.step == "qty":
+        try:
+            qty = float(text.replace(",", "").strip())
+        except ValueError:
+            send(ctx, "⚠️ 숫자만 입력. 예: 23 또는 0.5")
+            return
+        if qty <= 0:
+            send(ctx, "⚠️ 양수 수량만 가능")
+            return
+        wizard.advance(chat_id, "avg_cost", qty=qty)
+        ticker = state.data.get("ticker", "")
+        send(ctx, f"<b>➕ 종목 추가 — 3/3</b>\n<b>{_esc(ticker)}</b> 평단가는?\n<i>예: 21.47 또는 70000 (한국 종목)</i>")
+        return
+
+    if state.step == "avg_cost":
+        cleaned = text.replace(",", "").replace("$", "").replace("₩", "").strip()
+        try:
+            avg_cost = float(cleaned)
+        except ValueError:
+            send(ctx, "⚠️ 숫자만 입력. 예: 21.47")
+            return
+        if avg_cost <= 0:
+            send(ctx, "⚠️ 양수 평단만 가능")
+            return
+
+        ticker = state.data["ticker"]
+        qty = state.data["qty"]
+        result = _cmd_position_add([ticker, str(qty), str(avg_cost)], ctx)
+        wizard.cancel(chat_id)
+        send(ctx, result)
+        return
+
+
+def _handle_portfolio_update_step(text: str, ctx: BotContext, state) -> None:
+    """add 와 거의 동일하나 마지막에 update (allow_overwrite=True) 사용."""
+    chat_id = ctx.current_chat_id
+    user = ctx.current_user
+
+    if state.step == "ticker":
+        ticker = text.strip().upper()
+        # 기존 포지션 있는지 확인
+        db = SessionLocal()
+        try:
+            existing = crud.get_position(db, ticker, user_id=user.id) if user else None
+        finally:
+            db.close()
+        if not existing:
+            wizard.cancel(chat_id)
+            send(ctx, f"⚠️ <b>{_esc(ticker)}</b> 보유 안 함. 새로 추가하려면 메뉴의 ➕ 추가 사용.")
+            return
+        wizard.advance(chat_id, "qty", ticker=ticker, prev_qty=existing.qty, prev_avg=existing.avg_cost)
+        send(ctx, (
+            f"<b>✏️ 수정 — 2/3</b>\n"
+            f"<b>{_esc(ticker)}</b> 새 수량은?\n"
+            f"<i>현재: {existing.qty:g}주 @ ${existing.avg_cost:.2f}</i>"
+        ))
+        return
+
+    if state.step == "qty":
+        try:
+            qty = float(text.replace(",", "").strip())
+        except ValueError:
+            send(ctx, "⚠️ 숫자만 입력")
+            return
+        wizard.advance(chat_id, "avg_cost", qty=qty)
+        send(ctx, "<b>✏️ 수정 — 3/3</b>\n새 평단가는?")
+        return
+
+    if state.step == "avg_cost":
+        cleaned = text.replace(",", "").replace("$", "").replace("₩", "").strip()
+        try:
+            avg_cost = float(cleaned)
+        except ValueError:
+            send(ctx, "⚠️ 숫자만 입력")
+            return
+        ticker = state.data["ticker"]
+        qty = state.data["qty"]
+        result = _cmd_position_update([ticker, str(qty), str(avg_cost)], ctx)
+        wizard.cancel(chat_id)
+        send(ctx, result)
+        return
+
+
+def _send_portfolio_menu(ctx: BotContext) -> None:
+    """/portfolio (인자 없음) — 인라인 키보드 메뉴 발송."""
+    kb = _inline_kb([
+        [_kb_button("➕ 추가", "port:add"),       _kb_button("✏️ 수정", "port:update")],
+        [_kb_button("📋 목록", "port:list"),       _kb_button("📊 노출도", "port:exposure")],
+        [_kb_button("🗑 삭제", "port:delete"),     _kb_button("📦 일괄 입력", "port:import")],
+    ])
+    text = (
+        "<b>📊 포트폴리오 관리</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "버튼을 눌러 작업을 선택하세요.\n"
+        "<i>대화는 5분 무응답 시 자동 종료. /cancel 로 중단 가능.</i>"
+    )
+    send(ctx, text, reply_markup=kb)
+
+
 def cmd_portfolio(args: list[str], ctx: BotContext) -> str:
     """
     통합 포트폴리오 명령. /position 과 /exposure 의 슈퍼셋.
-    하위:
-      list     보유 + P&L + 다음 마일스톤
-      exposure 베타 + R² (M2-B)
-      add      포지션 추가
-      update   강제 갱신
-      remove   삭제
+    인자 없으면 인라인 메뉴 (Wizard), 인자 있으면 텍스트 모드 (기존).
     """
     if not args:
-        return _PORTFOLIO_HELP
+        _send_portfolio_menu(ctx)
+        return ""    # 빈 문자열 반환 → 추가 send 안 함
     sub = args[0].lower()
     rest = args[1:]
     if sub in ("list", "ls"):
@@ -992,9 +1290,26 @@ def cmd_portfolio(args: list[str], ctx: BotContext) -> str:
         return _cmd_position_update(rest, ctx)
     if sub in ("remove", "rm", "delete"):
         return _cmd_position_remove(rest, ctx)
+    if sub == "import":
+        return _cmd_portfolio_import_help()
     if sub in ("help", "?"):
         return _PORTFOLIO_HELP
     return f"알 수 없는 하위 명령: <code>{_esc(sub)}</code>\n\n" + _PORTFOLIO_HELP
+
+
+def _cmd_portfolio_import_help() -> str:
+    return (
+        "<b>📦 일괄 입력 — 자유 형식</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        "<code>/portfolio import</code> 다음 줄에 보유 종목을 자유롭게 적으면 LLM이 파싱.\n\n"
+        "예시:\n"
+        "<code>/portfolio import\n"
+        "삼성전자 10주 평단 70000\n"
+        "SOXL 23주 21.47\n"
+        "TQQQ 155 19.87\n"
+        "NVDA 50주 평균 $10.38</code>\n\n"
+        "<i>한국어/영어/숫자 형식 자유. 비용 ~$0.01 / 회</i>"
+    )
 
 
 # Backcompat — 기존 /position muscle memory 보존
@@ -1625,6 +1940,33 @@ def _try_multiline_bulk(text: str, ctx: BotContext) -> Optional[str]:
     # 모든 멀티라인 일괄 처리는 user-scoped
     user_id = _resolve_user_id(ctx)
 
+    # /portfolio import — 자유 형식 LLM 파싱
+    if cmd in ("portfolio", "port") and sub == "import":
+        if ctx.llm is None:
+            return "⚠️ LLM 비활성 — /portfolio import 사용 불가"
+        # 첫 줄 외 나머지가 본문
+        body = "\n".join(lines[1:]).strip()
+        if not body:
+            return _cmd_portfolio_import_help()
+        result = parse_free_form(ctx.llm, body, user_id=user_id)
+        if result is None:
+            return "⚠️ 파싱 실패 — 형식 다시 확인하거나 /portfolio add 명령 사용"
+        if not result.positions:
+            return ("⚠️ 인식된 종목 없음. 예시:\n"
+                    "<code>삼성전자 10주 70000\nSOXL 23 21.47</code>")
+        # 파싱 결과 → 기존 add 흐름 (중복 정책 자동 적용)
+        results: list[str] = []
+        for p in result.positions:
+            args2 = [p.ticker, str(p.qty), str(p.avg_cost)]
+            if p.note:
+                args2.extend(p.note.split())
+            results.append(_cmd_position_add(args2, ctx))
+        summary = _summarize_bulk(results, label="포지션 (LLM 파싱)")
+        if result.warnings:
+            summary += "\n\n⚠️ <b>경고</b>:\n" + "\n".join(f"  • {_esc(w)}" for w in result.warnings)
+        summary += f"\n\n<i>LLM 비용 ${result.cost_usd:.4f}</i>"
+        return summary
+
     # /portfolio add (또는 /position add, /pos add)
     if cmd in ("portfolio", "port", "position", "pos") and sub == "add":
         results: list[str] = []
@@ -1671,6 +2013,12 @@ def _summarize_bulk(results: list[str], label: str) -> str:
 
 
 def _process_update(update: dict, ctx: BotContext) -> None:
+    # 1. callback_query (인라인 키보드 클릭)
+    callback = update.get("callback_query")
+    if callback:
+        _process_callback(callback, ctx)
+        return
+
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return
@@ -1704,6 +2052,20 @@ def _process_update(update: dict, ctx: BotContext) -> None:
 
     ctx.current_user = user
     ctx.current_chat_id = chat_id
+
+    # 진행 중인 Wizard 가 있으면 단계 진행 (명령어 아니어도 OK)
+    state = wizard.get(chat_id)
+    if state is not None:
+        # /cancel 로 중단
+        if text.startswith("/cancel"):
+            wizard.cancel(chat_id)
+            send(ctx, "❌ 취소됐습니다.")
+            return
+        # 다른 명령으로 새 흐름 시작 시 wizard 끝내고 명령 처리로 이동
+        if not text.startswith("/"):
+            _wizard_handle_text(text, ctx, state)
+            return
+        wizard.cancel(chat_id)  # 새 명령 들어오면 wizard 종료
 
     if not text.startswith("/"):
         return  # 명령어 아니면 무시
@@ -1826,7 +2188,7 @@ def main() -> None:
     backoff = 1
     while True:
         try:
-            params = {"timeout": 30, "allowed_updates": ["message"]}
+            params = {"timeout": 30, "allowed_updates": ["message", "callback_query"]}
             if offset is not None:
                 params["offset"] = offset
             resp = requests.get(
