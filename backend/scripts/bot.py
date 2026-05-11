@@ -48,6 +48,7 @@ from backend.core.datasource.calendar_fetcher import CalendarFetcher
 from backend.core.exposure import compute_exposure, PortfolioExposure
 from backend.core.reminders import get_due_reminders, format_section as format_reminders
 from backend.core.portfolio_parser import parse_free_form
+from backend.core.daily_summary import build_personal_section
 from backend.core.post_mortem import update_returns, compute_statistics, format_stats_section
 
 log = logging.getLogger("bot")
@@ -564,6 +565,13 @@ def send_market_report(ctx: BotContext) -> None:
 
         for user in users:
             text = common_text
+            # 개인 일일 요약 (포트폴리오 + 워치리스트) — 빈 사용자는 자동 스킵
+            try:
+                personal = build_personal_section(ctx.provider, user.id)
+                if personal:
+                    text += "\n\n" + personal
+            except Exception as e:
+                log.error(f"[scheduler] 개인 요약 user={user.id} 실패 (무시): {e}")
             try:
                 due = get_due_reminders(user_id=user.id)
                 if due:
