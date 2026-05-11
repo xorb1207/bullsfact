@@ -157,8 +157,10 @@ def cmd_help(args: list[str], ctx: BotContext) -> str:
         "━━━━━━━━━━━━━━━━━\n"
         "\n"
         "<b>📊 시장 정보</b>\n"
+        "  /brief — 지금 브리핑 받기 (모닝 브리핑 즉시 재발송)\n"
+        "    매일 06:00 KST 자동 발송과 동일 내용\n"
+        "    매크로 해설은 24h 캐시 → 비용 0\n"
         "  /market — 시장 스냅샷 (지수/VIX/F&amp;G/상관)\n"
-        "    매일 06:00 KST 자동 발송\n"
         "  /list — 워치리스트 + RSI + 임박 이벤트\n"
         "  /why [TICKER] — LLM 매크로/티커 해설\n"
         "    예: /why SOXL, /why (인자 없으면 매크로)\n"
@@ -527,11 +529,51 @@ def cmd_market(args: list[str], ctx: BotContext) -> str:
     return body + events_section
 
 
+def build_briefing(ctx: BotContext, user: User, header: str = "🌅 <b>모닝 브리핑</b>") -> str:
+    """
+    단일 사용자용 브리핑 텍스트 빌드.
+    - 시장 스냅샷
+    - 매크로 해설 (LLM, 24h 캐시 → 같은 날 반복 호출은 비용 0)
+    - 개인 포트폴리오 + 워치리스트 (사용자별)
+    - 매도 리마인더 임박 항목
+
+    스케줄러(send_market_report)도 /brief 도 이 함수 호출.
+    """
+    snap = ctx.market.fetch()
+    text = header + "\n\n" + format_market(snap)
+
+    # 매크로 해설 (LLM 캐시 hit이면 즉답)
+    if ctx.llm is not None:
+        try:
+            briefing = generate_daily_recap(ctx.llm, snap, user_id=user.id)
+            if briefing:
+                text += "\n\n" + format_macro(briefing)
+        except Exception as e:
+            log.error(f"[briefing] 매크로 해설 실패 user={user.id} (무시): {type(e).__name__}: {e}")
+
+    # 개인 일일 요약
+    try:
+        personal = build_personal_section(ctx.provider, user.id)
+        if personal:
+            text += "\n\n" + personal
+    except Exception as e:
+        log.error(f"[briefing] 개인 요약 user={user.id} 실패 (무시): {e}")
+
+    # 매도 리마인더
+    try:
+        due = get_due_reminders(user_id=user.id)
+        if due:
+            text += "\n" + format_reminders(due)
+    except Exception as e:
+        log.error(f"[briefing] reminders user={user.id} 실패 (무시): {e}")
+
+    return text
+
+
 def send_market_report(ctx: BotContext) -> None:
     """
-    매일 자동 발송 (스케줄러 호출).
-    - 매크로 해설/시장 스냅샷은 모든 사용자 공통 (캐시 hit으로 LLM 1회만 호출)
-    - 매도 리마인더는 사용자별 (개인 일정)
+    매일 06:00 KST 스케줄러 — 모든 active user 에게 브리핑 broadcast.
+    매크로 해설 캐시(24h) 덕에 LLM 1회 호출 → N명에게 같은 본문.
     """
     try:
         log.info("[scheduler] 매일 시장 리포트 발송")
@@ -542,21 +584,6 @@ def send_market_report(ctx: BotContext) -> None:
         except Exception as e:
             log.error(f"[scheduler] 후속 추적 실패 (무시): {type(e).__name__}: {e}")
 
-        snap = ctx.market.fetch()
-        common_text = "🌅 <b>모닝 브리핑</b>\n\n" + format_market(snap)
-
-        if ctx.llm is not None:
-            try:
-                briefing = generate_daily_recap(ctx.llm, snap)
-                if briefing:
-                    common_text += "\n\n" + format_macro(briefing)
-                    log.info(f"[scheduler] 매크로 해설 추가 (cost ${briefing.cost_usd:.4f})")
-                else:
-                    log.warning("[scheduler] 매크로 해설 생성 실패 — 스킵")
-            except Exception as e:
-                log.error(f"[scheduler] 매크로 해설 예외 (무시): {type(e).__name__}: {e}")
-
-        # active 사용자 전체에게 broadcast (개인 매도 리마인더는 사용자별 첨부)
         db = SessionLocal()
         try:
             users = list(crud.list_users(db, active_only=True))
@@ -564,21 +591,8 @@ def send_market_report(ctx: BotContext) -> None:
             db.close()
 
         for user in users:
-            text = common_text
-            # 개인 일일 요약 (포트폴리오 + 워치리스트) — 빈 사용자는 자동 스킵
             try:
-                personal = build_personal_section(ctx.provider, user.id)
-                if personal:
-                    text += "\n\n" + personal
-            except Exception as e:
-                log.error(f"[scheduler] 개인 요약 user={user.id} 실패 (무시): {e}")
-            try:
-                due = get_due_reminders(user_id=user.id)
-                if due:
-                    text += "\n" + format_reminders(due)
-            except Exception as e:
-                log.error(f"[scheduler] reminders user={user.id} 실패 (무시): {e}")
-            try:
+                text = build_briefing(ctx, user)
                 send(ctx, text, chat_id=user.telegram_chat_id)
                 log.info(f"[scheduler] 브리핑 → user={user.id} ({user.name})")
             except Exception as e:
@@ -1823,6 +1837,17 @@ def cmd_feedback(args: list[str], ctx: BotContext) -> str:
     return f"✅ 피드백 #{row.id} 접수. 검토 후 반영합니다 🙏"
 
 
+def cmd_brief(args: list[str], ctx: BotContext) -> str:
+    """
+    /brief — 06:00 KST 모닝 브리핑을 지금 즉시 다시 받기.
+    매크로 해설은 24h 캐시 hit이라 같은 날에는 비용 0.
+    """
+    user = ctx.current_user
+    if user is None:
+        return "⚠️ 사용자 인증 실패"
+    return build_briefing(ctx, user, header="📨 <b>요청 브리핑</b>")
+
+
 def cmd_test(args: list[str], ctx: BotContext) -> str:
     """가짜 STRONG 시그널을 raw 모드로 발사 (LLM 비용 0)."""
     ticker = args[0].upper() if args else "ETH/USDT"
@@ -1864,6 +1889,9 @@ COMMANDS: dict[str, Callable[[list[str], BotContext], str]] = {
     "list":   cmd_list,
     "ls":     cmd_list,            # alias
     "why":    cmd_why,
+    "brief":  cmd_brief,
+    "digest": cmd_brief,           # alias
+    "morning": cmd_brief,          # alias
 
     # 워치리스트
     "add":    cmd_add,
@@ -1898,6 +1926,7 @@ COMMANDS: dict[str, Callable[[list[str], BotContext], str]] = {
 
 # Telegram 자동완성 메뉴 — 핵심 8개만. 시스템성/alias 는 제외.
 COMMAND_DESCRIPTIONS: list[tuple[str, str]] = [
+    ("brief",     "📨 지금 브리핑 받기 (모닝 브리핑 즉시 재발송)"),
     ("market",    "🌐 시장 스냅샷 (지수/VIX/F&G/상관)"),
     ("list",      "📋 워치리스트 + RSI + 임박 이벤트"),
     ("why",       "🔍 왜 움직이는가 — /why TICKER 또는 /why"),
