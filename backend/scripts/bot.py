@@ -1705,6 +1705,45 @@ _ADMIN_HELP = (
 )
 
 
+def _send_welcome(ctx: BotContext, user: User) -> None:
+    """신규 사용자 등록 시 환영 + 시작 가이드 발송. tier별 명령 차등."""
+    name = user.name or "님"
+    tier_desc = {
+        "OWNER":   "전체 권한",
+        "TRUSTED": "데이터 추가/수정 가능",
+        "LIMITED": "정보 조회만 가능",
+    }.get(user.tier, user.tier)
+
+    if user.tier == "LIMITED":
+        cmds = (
+            "  /brief — 지금 모닝 브리핑 받기\n"
+            "  /market — 시장 스냅샷 (지수/VIX/F&amp;G)\n"
+            "  /list — 워치리스트 + RSI\n"
+            "  /why TICKER — 종목 해설 (예: /why SOXL)\n"
+            "  /portfolio list — 포지션 조회"
+        )
+    else:  # OWNER / TRUSTED
+        cmds = (
+            "  /brief — 지금 모닝 브리핑 받기\n"
+            "  /portfolio — 보유 종목 관리 (메뉴/버튼)\n"
+            "  /add TICKER — 워치리스트 추가 (예: /add NVDA)\n"
+            "  /alert — 가격/VIX/F&amp;G 임계치 알림\n"
+            "  /why TICKER — 종목 해설\n"
+            "  /help — 전체 명령 안내"
+        )
+
+    msg = (
+        f"🎉 <b>등록 완료!</b>\n"
+        f"환영합니다, <b>{_esc(name)}</b>.\n"
+        f"권한: <b>{user.tier}</b> ({tier_desc})\n\n"
+        f"<b>추천 시작 흐름:</b>\n"
+        f"{cmds}\n\n"
+        f"📅 매일 <b>06:00 KST</b> 모닝 브리핑이 자동 발송됩니다.\n"
+        f"의견·제안은 <code>/feedback 내용</code> 으로 보내주세요."
+    )
+    send(ctx, msg, chat_id=user.telegram_chat_id)
+
+
 def _cmd_admin_user(args: list[str], ctx: BotContext) -> str:
     if not args:
         return _ADMIN_HELP
@@ -1732,8 +1771,27 @@ def _cmd_admin_user(args: list[str], ctx: BotContext) -> str:
             if tier not in ("OWNER", "TRUSTED", "LIMITED"):
                 return f"⚠️ TIER 오류: <code>{_esc(tier)}</code> (OWNER/TRUSTED/LIMITED)"
             name = " ".join(rest[2:]) if len(rest) > 2 else None
+
+            # 신규 vs 갱신 구분 — 환영 메시지는 신규만 발송 (재등록 spam 방지)
+            existing = crud.get_user_by_chat_id(db, chat_id)
+            is_new = existing is None
+
             row = crud.upsert_user(db, telegram_chat_id=chat_id, tier=tier, name=name)
-            return f"✅ 사용자 #{row.id} 등록: <b>{_esc(name or '?')}</b> [{tier}] chat={chat_id}"
+
+            welcome_status = ""
+            if is_new:
+                try:
+                    _send_welcome(ctx, row)
+                    welcome_status = "  · 환영 메시지 발송 ✓"
+                except Exception as e:
+                    log.warning(f"환영 메시지 발송 실패 user={row.id}: {type(e).__name__}: {e}")
+                    welcome_status = "  · ⚠️ 환영 메시지 발송 실패"
+
+            suffix = "" if is_new else "  (기존 사용자 갱신)"
+            return (
+                f"✅ 사용자 #{row.id} 등록: <b>{_esc(name or '?')}</b> "
+                f"[{tier}] chat={chat_id}{suffix}{welcome_status}"
+            )
         if sub == "tier":
             if len(rest) < 2:
                 return "사용법: <code>/admin user tier ID NEW_TIER</code>"
