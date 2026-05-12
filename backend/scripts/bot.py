@@ -1697,8 +1697,11 @@ _ADMIN_HELP = (
     "<b>/admin user list</b>\n"
     "<b>/admin user add CHAT_ID TIER [이름]</b>\n"
     "  TIER: OWNER | TRUSTED | LIMITED\n"
+    "  (신규 사용자에게 환영 메시지 자동 발송)\n"
     "<b>/admin user tier ID NEW_TIER</b>\n"
-    "<b>/admin user remove ID</b>\n\n"
+    "<b>/admin user remove ID</b>\n"
+    "<b>/admin user welcome ID</b>  특정 사용자에게 환영 메시지 재발송\n"
+    "<b>/admin user welcome all</b>  모든 active user 에게 (OWNER 제외)\n\n"
     "<b>/admin feedback list</b>  (대기만)\n"
     "<b>/admin feedback all</b>  (전체)\n"
     "<b>/admin feedback done ID</b>"
@@ -1823,6 +1826,41 @@ def _cmd_admin_user(args: list[str], ctx: BotContext) -> str:
             user.active = False
             db.commit()
             return f"🗑️ #{uid} 비활성"
+
+        if sub == "welcome":
+            # /admin user welcome ID 또는 /admin user welcome all
+            if not rest:
+                return "사용법: <code>/admin user welcome ID</code> 또는 <code>/admin user welcome all</code>"
+            target = rest[0].lower()
+            if target == "all":
+                users = list(crud.list_users(db, active_only=True))
+                # OWNER 제외 — 본인은 환영 메시지 필요 없음
+                targets = [u for u in users if u.tier != "OWNER"]
+                if not targets:
+                    return "발송 대상 없음 (OWNER 외 사용자 0명)"
+                sent = 0
+                failed = 0
+                for u in targets:
+                    try:
+                        _send_welcome(ctx, u)
+                        sent += 1
+                    except Exception as e:
+                        log.warning(f"welcome 발송 실패 user={u.id}: {type(e).__name__}: {e}")
+                        failed += 1
+                return f"📨 환영 메시지: ✅ {sent}건 발송 / ⚠️ {failed}건 실패"
+            try:
+                uid = int(target)
+            except ValueError:
+                return f"ID 파싱 실패: {_esc(target)} (또는 'all')"
+            user = db.get(User, uid)
+            if not user:
+                return f"❌ 없음: #{uid}"
+            try:
+                _send_welcome(ctx, user)
+                return f"✅ #{uid} ({user.name or '?'}) 환영 메시지 발송"
+            except Exception as e:
+                return f"⚠️ 발송 실패: <code>{_esc(type(e).__name__)}</code>"
+
         return _ADMIN_HELP
     finally:
         db.close()
