@@ -52,6 +52,9 @@ def _format_enrichment(ctx: EnrichmentContext) -> str:
     parts = ["", "━━━ 컨텍스트 ━━━"]
     if ctx.headline:
         parts.append(f"📰 {_esc(ctx.headline)}")
+    if ctx.null_result_note:
+        # M3 — 아이콘 포함된 한 줄 ("📋 점검 완료: ... → ..."). 그대로 노출.
+        parts.append(_esc(ctx.null_result_note))
     if ctx.risk_flags:
         parts.append(f"⚠️ {_esc(', '.join(ctx.risk_flags))}")
     for persp, label in _PERSPECTIVE_LABEL.items():

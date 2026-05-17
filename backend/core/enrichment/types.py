@@ -28,3 +28,6 @@ class EnrichmentContext:
     risk_flags: list[str] = field(default_factory=list)  # ["earnings_d3", "fomc_tomorrow"]
     cost_cents: float = 0.0
     latency_ms: int = 0
+    # M3 — 모든 애널리스트 empty 시 분류 한 줄 ("📋 점검 완료: ... → ...").
+    # 설정되면 perspectives/headline 은 비어 있고 이 라인만 컨텍스트에 표시.
+    null_result_note: Optional[str] = None

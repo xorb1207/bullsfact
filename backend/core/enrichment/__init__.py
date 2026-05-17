@@ -8,6 +8,7 @@ from .base import Analyst, Enricher
 from .orchestrator import StubEnricher, LLMEnricher
 from .llm_client import LLMClient, BudgetExceeded
 from .synthesizer import Synthesizer
+from .null_result import classify_null_result
 
 __all__ = [
     "EnrichmentContext",
@@ -20,4 +21,5 @@ __all__ = [
     "LLMClient",
     "BudgetExceeded",
     "Synthesizer",
+    "classify_null_result",
 ]
