@@ -13,9 +13,10 @@ from typing import Optional
 
 from .base import Analyst, Enricher
 from .llm_client import BudgetExceeded
+from .null_result import classify_null_result
 from .synthesizer import Synthesizer
 from .types import AnalystResult, EnrichmentContext, Perspective
-from ..strategy.dip_buy import Signal
+from ..strategy.dip_buy import Signal, SignalStrength
 
 log = logging.getLogger(__name__)
 
@@ -129,11 +130,34 @@ class LLMEnricher(Enricher):
         try:
             results = self._run_analysts(signal, source)
 
-            # 모든 애널리스트 데이터가 비어있으면 LLM 호출 안 함 (낭비)
+            # 모든 애널리스트 데이터가 비어있을 때:
+            #   - WEAK/threshold (= STRONG 아님) → 폴백 None (비용 가드)
+            #   - STRONG → M3 null_result_classifier 호출, 한 줄 분류 컨텍스트로
             has_any = any((r.summary or r.citations) and not r.error for r in results)
             if not has_any:
-                log.info("[LLMEnricher] 수집된 데이터 없음 → LLM 호출 생략")
-                return None
+                if signal.strength != SignalStrength.STRONG:
+                    log.info("[LLMEnricher] 수집 데이터 없음 + non-STRONG → 호출 생략")
+                    return None
+                outcome = classify_null_result(self.synthesizer.llm, signal, results)
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                if not outcome:
+                    log.info("[LLMEnricher] null_result 분류 실패 → 폴백")
+                    return None
+                note, cost_usd = outcome
+                cost_cents = round(cost_usd * 100, 2)
+                log.info(
+                    f"[LLMEnricher] {signal.ticker} null_result 분류 발급 "
+                    f"({elapsed_ms}ms, ¢{cost_cents:.2f})"
+                )
+                return EnrichmentContext(
+                    headline="",
+                    citations=[],
+                    perspectives={},
+                    risk_flags=[],
+                    cost_cents=cost_cents,
+                    latency_ms=elapsed_ms,
+                    null_result_note=note,
+                )
 
             ctx = self.synthesizer.synthesize(signal, source, results)
             ctx.latency_ms = int((time.monotonic() - t0) * 1000)
