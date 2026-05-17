@@ -27,7 +27,7 @@ from backend.core.positions import PositionEvaluator
 from backend.core.market import MarketFetcher
 from backend.core.datasource.calendar_fetcher import CalendarFetcher
 from backend.core.enrichment import LLMClient, LLMEnricher, Synthesizer
-from backend.core.enrichment.analysts import NewsAnalyst, FundamentalsAnalyst
+from backend.core.enrichment.analysts import NewsAnalyst, FundamentalsAnalyst, FilingAnalyst
 from backend.db import init_db, SessionLocal, crud
 
 load_dotenv(override=True)  # .env가 셸 환경변수보다 우선
@@ -97,7 +97,7 @@ def build_pipeline() -> Pipeline:
         on_call=_persist_llm_call,
     )
     enricher = LLMEnricher(
-        analysts=[NewsAnalyst(), FundamentalsAnalyst()],
+        analysts=[NewsAnalyst(), FundamentalsAnalyst(), FilingAnalyst(llm=llm)],
         synthesizer=Synthesizer(
             llm=llm,
             model=os.getenv("LLM_MODEL_ENRICHMENT", "claude-haiku-4-5"),
