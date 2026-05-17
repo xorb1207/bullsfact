@@ -138,18 +138,23 @@ class LLMEnricher(Enricher):
                 if signal.strength != SignalStrength.STRONG:
                     log.info("[LLMEnricher] 수집 데이터 없음 + non-STRONG → 호출 생략")
                     return None
-                note = classify_null_result(self.synthesizer.llm, signal, results)
+                outcome = classify_null_result(self.synthesizer.llm, signal, results)
                 elapsed_ms = int((time.monotonic() - t0) * 1000)
-                if not note:
+                if not outcome:
                     log.info("[LLMEnricher] null_result 분류 실패 → 폴백")
                     return None
-                log.info(f"[LLMEnricher] {signal.ticker} null_result 분류 발급 ({elapsed_ms}ms)")
+                note, cost_usd = outcome
+                cost_cents = round(cost_usd * 100, 2)
+                log.info(
+                    f"[LLMEnricher] {signal.ticker} null_result 분류 발급 "
+                    f"({elapsed_ms}ms, ¢{cost_cents:.2f})"
+                )
                 return EnrichmentContext(
                     headline="",
                     citations=[],
                     perspectives={},
                     risk_flags=[],
-                    cost_cents=0.0,
+                    cost_cents=cost_cents,
                     latency_ms=elapsed_ms,
                     null_result_note=note,
                 )

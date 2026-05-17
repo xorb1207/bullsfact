@@ -109,8 +109,33 @@ def _weak_signal(ticker: str = "SOXL") -> Signal:
 
 # ── 케이스 ──────────────────────────────────────────
 
+def _clear_null_result_cache(ticker: str) -> None:
+    """테스트 안정성 — 직전 실행이 남긴 캐시 row 제거 (LLM 경로 강제 통과용)."""
+    try:
+        from backend.core.enrichment.null_result import _cache_key, PURPOSE
+        from backend.db import SessionLocal
+        from backend.db.models import LLMCache
+        key = _cache_key(ticker)
+        db = SessionLocal()
+        try:
+            rows = db.query(LLMCache).filter(
+                LLMCache.purpose == PURPOSE,
+                LLMCache.cache_key == key,
+            ).all()
+            for r in rows:
+                db.delete(r)
+            if rows:
+                db.commit()
+                log.info(f"  (cleanup) {len(rows)}개 캐시 row 제거: {key}")
+        finally:
+            db.close()
+    except Exception as e:
+        log.debug(f"  (cleanup) 캐시 제거 실패 무시: {e}")
+
+
 def case_strong_all_empty() -> None:
     log.info("=== Case 1: STRONG + 모든 애널리스트 empty → null_result_note 발급 ===")
+    _clear_null_result_cache("SOXL")
     llm, seen = _make_mock_llm("특이사항 없음 / 원인 불명 수급 가능성")
     enricher = LLMEnricher(
         analysts=[_EmptyAnalyst("news"), _EmptyAnalyst("fundamentals", fail=True)],
@@ -126,11 +151,17 @@ def case_strong_all_empty() -> None:
     assert "원인 불명 수급 가능성" in ctx.null_result_note
     assert ctx.perspectives == {}, "null_result 케이스에서 perspectives 비어야 함"
     assert ctx.headline == ""
+    # 캐시 미스 경로 (사전에 클리어) — 실제 LLM 비용이 cost_cents 에 반영돼야 함
+    # mock usage: input=120 / output=12 Haiku 단가 산출 → > 0 보장
+    assert ctx.cost_cents > 0.0, (
+        f"null_result LLM 호출됐는데 cost_cents=0: {ctx.cost_cents}"
+    )
 
     assert any(c["purpose"] == PURPOSE for c in seen), (
         f"null_result_classifier 호출 안 됨 (seen={seen!r})"
     )
     log.info(f"  → note: {ctx.null_result_note}")
+    log.info(f"  → cost_cents: {ctx.cost_cents}")
     log.info("  ✓ 통과")
 
 
@@ -210,13 +241,42 @@ def case_llm_empty_response_falls_back() -> None:
     log.info("  ✓ 통과")
 
 
+def case_cache_hit_zero_cost() -> None:
+    log.info("=== Case 6: 같은 ticker 재호출 → 캐시 히트, cost_cents=0 ===")
+    # case 1 직후 같은 SOXL 윈도에 캐시가 존재 (case 1 이 _cache_put 호출했음)
+    llm, seen = _make_mock_llm("이번엔 호출되면 안 됨")
+    enricher = LLMEnricher(
+        analysts=[_EmptyAnalyst("news"), _EmptyAnalyst("fundamentals")],
+        synthesizer=Synthesizer(llm=llm, model="claude-haiku-4-5"),
+    )
+    ctx = enricher.enrich(_strong_signal("SOXL"), "yfinance")
+
+    assert ctx is not None, "캐시 히트는 EnrichmentContext 반환 기대"
+    assert ctx.null_result_note, "캐시 히트도 note 채워져야 함"
+    assert ctx.cost_cents == 0.0, (
+        f"캐시 히트는 신규 비용 0 이어야 함: {ctx.cost_cents}"
+    )
+    assert not any(c["purpose"] == PURPOSE for c in seen), (
+        f"캐시 히트인데 LLM 호출됨: {seen!r}"
+    )
+    log.info(f"  → note: {ctx.null_result_note}")
+    log.info(f"  → cost_cents: {ctx.cost_cents} (캐시 히트)")
+    log.info("  ✓ 통과")
+
+
 def main() -> int:
+    # 캐시 테이블이 없으면 case 6 (캐시 히트 검증) 가 의미 없으므로 보장.
+    # init_db 는 idempotent (create_all → 없는 테이블만 생성).
+    from backend.db import init_db
+    init_db()
+
     try:
         case_strong_all_empty()
         case_weak_all_empty_skips_llm()
         case_strong_has_data_goes_synth()
         case_alerter_format_renders_note()
         case_llm_empty_response_falls_back()
+        case_cache_hit_zero_cost()
     except AssertionError as e:
         log.error(f"❌ 테스트 실패: {e}")
         return 1

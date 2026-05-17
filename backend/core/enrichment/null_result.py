@@ -148,9 +148,13 @@ def classify_null_result(
     model: str = _DEFAULT_MODEL,
     use_cache: bool = True,
     user_id: Optional[int] = None,
-) -> Optional[str]:
+) -> Optional[tuple[str, float]]:
     """
-    "📋 점검 완료: {checked} → {classification}" 한 줄 반환.
+    ("📋 점검 완료: {checked} → {classification}", cost_usd) 페어 반환.
+
+    cost_usd:
+        - 캐시 히트 → 0.0 (이번 호출에서 신규 발생 비용 없음)
+        - 실제 호출 → usage.cost_usd()
 
     None 반환 조건: 예산 초과 / LLM 실패 / 분류 결과 빈 문자열.
     호출자는 None 이면 raw 알람으로 폴백.
@@ -162,7 +166,7 @@ def classify_null_result(
         cached = _try_cache_get(key)
         if cached:
             log.info(f"[NullResult] cache hit: {key}")
-            return f"📋 점검 완료: {checked} → {cached}"
+            return f"📋 점검 완료: {checked} → {cached}", 0.0
 
     user = _build_user_prompt(signal, results)
     try:
@@ -188,11 +192,12 @@ def classify_null_result(
         log.warning("[NullResult] LLM 응답 비어있음 → 폴백")
         return None
 
+    cost_usd = usage.cost_usd()
     if use_cache:
-        _cache_put(key, classification, usage.cost_usd())
+        _cache_put(key, classification, cost_usd)
 
     log.info(
         f"[NullResult] {signal.ticker} → {classification!r} "
-        f"(cost=${usage.cost_usd():.5f})"
+        f"(cost=${cost_usd:.5f})"
     )
-    return f"📋 점검 완료: {checked} → {classification}"
+    return f"📋 점검 완료: {checked} → {classification}", cost_usd
